@@ -1,0 +1,112 @@
+# Baked-in configuration — qwen38-27b engine.
+#
+# Filled at build time (B3) from SCENARIO.md. The runtime takes no required
+# parameters — the user provides only the model files. Quality parameters
+# ([engine].model, [sampling]) are baked as defaults and CLI-overridable;
+# performance coefficients ([model], [performance], [serving]) are baked and
+# printed in the startup log. Precedence: per-request > CLI > config.toml.
+
+[engine]
+name = "qwen38-27b"
+# The GGUF directory. The engine loads three GGUFs from it: the main model
+# (Q6_K), the draft (dflash2, Q8_0), and the mmproj (Qwen3-VL ViT, Q8_0).
+# See [checkpoint] below for the per-file names.
+model = "/home/hhy/Models/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2-GGUF"
+# Weight/activation dtype. The weights are GGUF-quantized (Q6_K main, Q8_0
+# draft/mmproj) and stay quantized (no dequantize-to-bf16 — the 54 GB bf16
+# dequant does not fit 37.31 GiB). The activations and the compute are BF16.
+dtype = "bfloat16"
+# Tensor-parallelism size. 1 = no TP. The profile uses a non-uniform layer
+# split across 2 GPUs (activation handoff only, no per-layer all-reduce), not
+# TP — see [distributed].layer_split. TP=2 over PCIe would be ~128
+# all-reduces/token and eat into the 20 tok/s budget.
+tp = 1
+
+[checkpoint]
+# The three GGUF files in the [engine].model directory. The main model is the
+# Q6_K; the draft is the dflash2 speculative-decode draft (Q8_0); the mmproj
+# is the Qwen3-VL vision tower (Q8_0).
+main = "Qwen3.8-27B-EfficientThink-SimPO-Q6_K.gguf"
+draft = "dflash2-qwen38-27b-Q8_0.gguf"
+mmproj = "mmproj-Qwen3.8-27B-Q8_0.gguf"
+
+[model]
+# Engine max context (prompt + generation). 100k = the scenario's floor.
+# 256k (the model max) does not fit once the draft KV cache is counted
+# (40.29 GiB > 37.31 GiB usable). See SCENARIO.md Capacity.
+max_context = 100000
+# Default max_tokens for requests that omit it. The load's max output len.
+max_new_tokens = 4096
+
+[sampling]
+# Defaults baked from the origin CLI (parity with what the agent currently
+# gets). CLI-overridable at startup; per-request fields override them.
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+
+[performance]
+# Baked-in coefficients — printed in the startup log, not settable at runtime.
+max_running_requests = 1      # concurrency 1 (single-stream, no continuous batching)
+memory_ratio = 0.9            # fraction of GPU memory reserved for the KV cache
+page_size = 1                 # KV-cache page size (tokens per page)
+attention_backend = "fi"      # FlashInfer for the 16 full-attn layers (the GDN
+                              # 48 layers use the ported llama.cpp GDN kernel, not the seam)
+cache_type = "naive"          # PagedAttention (not RadixAttention — no repeated prefixes)
+cuda_graph_max_bs = 1         # CUDA graphs for decode at concurrency 1 (launch-bound)
+max_prefill_length = 1024     # chunked-prefill chunk size (ubatch 1024, matches origin)
+
+[distributed]
+# Non-uniform layer split across 2 GPUs (PCIe, no NVLink). The 64 main-model
+# layers are partitioned; the activation tensor is handed off at the split
+# boundary (one copy per forward pass, ~1.3 ms/token — vs ~6-8 ms/token for TP).
+# Rank i binds to cuda:i. Live nvidia-smi: GPU0 = 4070 Ti Super (sm_89,
+# 15.99 GiB, smaller) -> rank 0 -> lower layers (26). GPU1 = 2080 Ti (sm_75,
+# 21.32 GiB, larger) -> rank 1 -> upper layers (38) + draft + mmproj.
+# 26 + 38 = 64 main-model layers.
+layer_split = [26, 38]
+# The draft model runs on GPU 1 (the 2080 Ti, where the upper layers + logits
+# live), matching the origin's --spec-draft-device CUDA1.
+draft_device = 1
+
+[speculative]
+# Speculative decoding with the dflash2 draft. The draft generates up to
+# n_max draft tokens per step; the main model verifies them in one forward
+# pass. In scope (the user confirmed; the origin uses --spec-type draft-dflash
+# --spec-draft-n-max 6).
+enabled = true
+n_max = 6
+
+[vision]
+# The Qwen3-VL vision tower (mmproj). The API accepts image input (base64 or
+# URL) alongside text. In scope (the user confirmed; the origin runs --mmproj).
+enabled = true
+
+[serving]
+host = "0.0.0.0"
+port = 8080
+# Which metric the engine must beat the origin baseline on (engine-verify).
+# throughput = decode tok/s (the target is decode >= 20 tok/s).
+priority = "throughput"
+# How long the supervisor waits for a freshly started server to answer one
+# small non-streaming OpenAI chat completion (max_tokens=1). A 23 GB model
+# needs a long load window (GGUF load + kernel compile + CUDA graph capture).
+health_timeout_s = 300
+
+[bench]
+# The fixed benchmark harness (--bench) workload. suite = latency-1 (the
+# replacement gate: one length at concurrency 1). prompt_tokens = 60k (the
+# load's max input; the target is TTFT(60k) < 30 s). new_tokens = 4k (the
+# load's max output; the target is decode >= 20 tok/s).
+suite = "latency-1"
+prompt_tokens = 60000
+new_tokens = 4096
+runs = 5
+warmup = 2
+
+[origin]
+# The agent's pre-existing model service (llama-server, confirmed verbatim by
+# the user in B0). The supervisor renders {port} (the spare port during a
+# measurement, the agent port when this service is restored).
+command = "llama-server -m /home/hhy/Models/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2-GGUF/Qwen3.8-27B-EfficientThink-SimPO-Q6_K.gguf -md /home/hhy/Models/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2-GGUF/dflash2-qwen38-27b-Q8_0.gguf --mmproj /home/hhy/Models/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf --device CUDA0,CUDA1 --tensor-split 22,22 --chat-template-kwargs '{\"preserve_thinking\": true, \"reasoning_effort\": \"medium\"}' --jinja --spec-type draft-dflash --spec-draft-n-max 6 --spec-draft-ngl 99 --spec-draft-device CUDA1 --fit off -t 16 --n-gpu-layers 99 --ctx-size 102400 --batch-size 1024 --ubatch-size 1024 --cache-type-k q8_0 --cache-type-v q8_0 --image-min-tokens 1024 --parallel 1 --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --cache-ram 9000 --flash-attn on --load-mode none --host 0.0.0.0 --port {port}"

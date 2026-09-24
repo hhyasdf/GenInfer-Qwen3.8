@@ -1,0 +1,55 @@
+# pycache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# installed packages
+*.dist-info/
+*.egg-info/
+
+# json files (the upstream mini-sglang generates JSON at runtime; the scaffold
+# tracks its own golden + toy-model JSON via the ! exceptions below)
+*.json
+*.jsonl
+!golden/logits.json
+!models/tiny-llama/config.json
+!models/tiny-llama/tokenizer.json
+!models/tiny-llama/tokenizer_config.json
+
+# profiling data
+*.nsys-rep
+*.ncu-rep
+
+# binaries
+build/
+dist/
+*.tar.gz
+
+# virtual environment
+.venv/
+venv/
+env/
+
+# clangd config
+.clangd
+
+# .vscode
+.vscode
+.coverage
+
+# supervisor state (written by the skill's supervisor; a stale one means the supervisor died)
+.engine.pid
+.restart-requested
+.backend
+.force-takeover
+.gpu-window
+.gpu-window-cmd
+.engine-code.prev/
+logs/
+.tmp-repro/
+
+# test / lint / coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.htmlcov/
