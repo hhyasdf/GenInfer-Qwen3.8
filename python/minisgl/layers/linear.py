@@ -4,7 +4,7 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
-from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.distributed import DistributedCommunicator, get_shard_size
 from minisgl.utils import div_even
 
 from .base import BaseOP
@@ -60,9 +60,10 @@ class LinearColParallelMerged(_LinearTPImpl):
         output_sizes: List[int],
         has_bias: bool,
     ):
-        # check that all output sizes are divisible by tp_size
-        tp_info = get_tp_info()
-        tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        # check that all output sizes are divisible by the shard size
+        # (TP world size; 1 in PP mode where the weight is not sharded)
+        shard_size = get_shard_size()
+        tp_output_sizes = [div_even(size, shard_size) for size in output_sizes]
         output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
         super().__init__(input_size, output_size, input_size, tp_output_size, has_bias)
@@ -77,10 +78,10 @@ class LinearQKVMerged(_LinearTPImpl):
         num_kv_heads: int,
         has_bias: bool,
     ):
-        tp_info = get_tp_info()
+        shard_size = get_shard_size()
 
-        local_num_qo = div_even(num_qo_heads, tp_info.size)
-        local_num_kv = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        local_num_qo = div_even(num_qo_heads, shard_size)
+        local_num_kv = div_even(num_kv_heads, shard_size, allow_replicate=True)
         full_isize = hidden_size
         full_osize = (num_qo_heads + 2 * num_kv_heads) * head_dim
         local_isize = hidden_size
@@ -90,13 +91,13 @@ class LinearQKVMerged(_LinearTPImpl):
 
 class LinearOProj(_LinearTPImpl):
     def __init__(self, input_size: int, output_size: int, has_bias: bool):
-        tp_info = get_tp_info()
+        shard_size = get_shard_size()
         full_isize = input_size
         full_osize = output_size
-        local_isize = div_even(input_size, tp_info.size)
+        local_isize = div_even(input_size, shard_size)
         local_osize = output_size
         self._comm = DistributedCommunicator()
-        self._tp_size = tp_info.size
+        self._tp_size = shard_size
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -113,11 +114,11 @@ class LinearRowParallel(_LinearTPImpl):
         output_size: int,
         has_bias: bool,
     ):
-        tp_info = get_tp_info()
-        local_input_size = div_even(input_size, tp_info.size)
+        shard_size = get_shard_size()
+        local_input_size = div_even(input_size, shard_size)
         local_output_size = output_size
         self._comm = DistributedCommunicator()
-        self._tp_size = tp_info.size
+        self._tp_size = shard_size
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

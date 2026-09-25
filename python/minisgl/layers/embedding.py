@@ -5,7 +5,7 @@ from typing import Dict
 import torch
 import torch.nn.functional as F
 from minisgl.core import get_global_ctx
-from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.distributed import DistributedCommunicator, get_shard_size, get_tp_info
 from minisgl.utils import div_ceil, nvtx_annotate
 
 from .base import BaseOP
@@ -18,9 +18,10 @@ class VocabParallelEmbedding(BaseOP):
         embedding_dim: int,
     ):
         super().__init__()
-        tp_info = get_tp_info()
-        tp_rank = tp_info.rank
-        self.tp_size = tp_info.size
+        # The vocab is sharded only by TP; in PP (layer split) mode each stage
+        # keeps the full vocab (shard size 1, rank 0).
+        self.tp_size = get_shard_size()
+        tp_rank = get_tp_info().rank if self.tp_size > 1 else 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_tp = div_ceil(num_embeddings, self.tp_size)
         start_idx = self.num_embeddings_tp * tp_rank

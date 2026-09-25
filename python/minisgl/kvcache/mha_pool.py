@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from minisgl.distributed import get_tp_info
+from minisgl.distributed import get_shard_size
 from minisgl.utils import div_even
 
 from .base import BaseKVCachePool
@@ -23,8 +23,9 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        tp_info = get_tp_info()
-        local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        # In PP (layer split) mode each stage keeps ALL KV heads of the layers
+        # it owns (get_shard_size() == 1); only TP shards the heads.
+        local_kv_heads = div_even(num_kv_heads, get_shard_size(), allow_replicate=True)
         self._kv_buffer = torch.empty(
             (2, num_layers, num_pages, page_size, local_kv_heads, head_dim),
             device=device,

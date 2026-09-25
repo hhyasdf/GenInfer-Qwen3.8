@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict
 from transformers import PretrainedConfig
 
@@ -182,4 +182,121 @@ class ModelConfig:
             gdn_group_count=gdn_group_count,
             gdn_time_step_rank=gdn_time_step_rank,
             gdn_inner_size=gdn_inner_size,
+        )
+
+
+@dataclass(frozen=True)
+class DflashConfig:
+    """DFlash2 draft-model config (the ``dflash`` GGUF architecture).
+
+    A block-diffusion draft model for speculative decoding. It fuses the
+    target model's features (from ``target_layers``) into a single embedding
+    via an encoder, then generates a block of ``block_size`` draft tokens with
+    a 5-layer decoder (non-causal attention + dynamic conv + SwiGLU MLP) and a
+    selector (top-k candidates + pairwise transition scores).
+
+    The draft model has NO own embedding or lm_head — it shares the target
+    model's ``tok_embd`` and ``output`` (via the GGUF's ``ctx_other``).
+    """
+    num_layers: int            # 5
+    hidden_size: int           # 5120
+    intermediate_size: int     # 17408
+    num_qo_heads: int          # 32
+    num_kv_heads: int          # 8
+    head_dim: int              # 128
+    vocab_size: int            # 248320
+    rms_norm_eps: float        # 1e-6
+    # --- block-diffusion / selector fields ---
+    block_size: int            # 8
+    conv_kernel_size: int      # 2
+    conv_group_size: int       # 16
+    selector_rank: int         # 256
+    selector_top_k: int        # 16
+    target_layers: tuple[int, ...]  # (6, 20, 34, 48, 62)
+    # --- attention / rope ---
+    causal: bool               # False (non-causal block diffusion)
+    sliding_window: int        # 2048
+    rope_base: float           # 1e7
+    rope_dim: int              # 64 (partial rope: 64 of 128 dims)
+    max_position: int          # 262144
+    # --- derived: encoder input dim = len(target_layers) * hidden_size ---
+    encoder_input_dim: int = 0
+
+    @property
+    def n_groups(self) -> int:
+        """Number of conv groups (hidden_size / conv_group_size)."""
+        return self.hidden_size // self.conv_group_size
+
+    @property
+    def conv_proj_dim(self) -> int:
+        """Dynamic-conv projection dim (conv_kernel_size * 2 * n_groups)."""
+        return self.conv_kernel_size * 2 * self.n_groups
+
+    @property
+    def selector_row_used(self) -> int:
+        """Selector packed-row width (top_k + top_k^2)."""
+        return self.selector_top_k + self.selector_top_k * self.selector_top_k
+
+    @classmethod
+    def from_gguf(cls, meta: Dict[str, Any]) -> DflashConfig:
+        """Build a DflashConfig from the draft GGUF's metadata.
+
+        The draft GGUF's architecture is ``dflash``; its fields live under the
+        ``dflash.*`` prefix. The vocab size is the length of the tokenizer
+        token list.
+        """
+        def g(key: str, default: Any = None) -> Any:
+            return meta.get("dflash." + key, default)
+
+        tokens = meta.get("tokenizer.ggml.tokens")
+        vocab_size = len(tokens) if isinstance(tokens, list) else int(
+            meta.get("tokenizer.ggml.bpe.vocab_size", 0))
+
+        num_layers = int(g("block_count", 0))
+        hidden_size = int(g("embedding_length", 0))
+        intermediate_size = int(g("feed_forward_length", 0))
+        num_qo_heads = int(g("attention.head_count", 0))
+        num_kv_heads = int(g("attention.head_count_kv", num_qo_heads))
+        head_dim = int(g("attention.key_length", hidden_size // max(num_qo_heads, 1)))
+        rms_norm_eps = float(g("attention.layer_norm_rms_epsilon", 1e-6))
+        block_size = int(g("block_size", 8))
+        conv_kernel_size = int(g("conv_kernel_size", 2))
+        conv_group_size = int(g("conv_group_size", 16))
+        selector_rank = int(g("selector_rank", 256))
+        selector_top_k = int(g("selector_top_k", 16))
+        target_layers = tuple(int(x) for x in (g("target_layers") or []))
+        causal = bool(g("attention.causal", False))
+        sliding_window = int(g("attention.sliding_window", 0))
+        rope_base = float(g("rope.freq_base", 1e7))
+        # Partial rope: the rope dim is the sum of dimension_sections
+        # (e.g. [64, 0, 0, 0] -> 64 of 128 dims). Fall back to dimension_count
+        # or head_dim when neither is present.
+        rope_sections = g("rope.dimension_sections", None)
+        if isinstance(rope_sections, list) and any(int(x) > 0 for x in rope_sections):
+            rope_dim = int(sum(int(x) for x in rope_sections))
+        else:
+            rope_dim = int(g("rope.dimension_count", head_dim))
+        max_position = int(g("context_length", 2048))
+
+        return cls(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            vocab_size=vocab_size,
+            rms_norm_eps=rms_norm_eps,
+            block_size=block_size,
+            conv_kernel_size=conv_kernel_size,
+            conv_group_size=conv_group_size,
+            selector_rank=selector_rank,
+            selector_top_k=selector_top_k,
+            target_layers=target_layers,
+            causal=causal,
+            sliding_window=sliding_window,
+            rope_base=rope_base,
+            rope_dim=rope_dim,
+            max_position=max_position,
+            encoder_input_dim=len(target_layers) * hidden_size,
         )

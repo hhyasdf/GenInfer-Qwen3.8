@@ -6,7 +6,7 @@ from typing import Dict, Iterator, Tuple
 
 import safetensors
 import torch
-from minisgl.distributed import get_tp_info
+from minisgl.distributed import get_shard_size, get_tp_info
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
@@ -91,6 +91,10 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
+    # Tensors are sharded only by TP; in PP (layer split) mode each stage loads
+    # the full tensor for the layers it owns (shard size 1, rank 0).
+    shard_size = get_shard_size()
+    shard_rank = tp_info.rank if shard_size > 1 else 0
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -103,7 +107,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                     continue
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")
-                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
+                tensor = _shard_tensor(name, raw, shard_rank, shard_size, config.num_kv_heads)
                 del raw
 
                 if (info := _get_merge_info(name)) is None:

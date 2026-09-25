@@ -531,6 +531,7 @@ class Qwen35ForCausalLM(BaseLLMModel):
         self.config = config
         # Set by the engine after the communication group is set up.
         self.comm = None
+        self.rank = 0
         self.world_size = 1
         self.dtype = torch.bfloat16
 
@@ -556,33 +557,46 @@ class Qwen35ForCausalLM(BaseLLMModel):
             h, residual = self.model.forward(ctx.batch.input_ids)
             self._send_handoff(h, residual)
             return None  # no logits on the front rank
-        # Back rank: receive the handoff. Run the upper layers + the norm + the lm_head.
+        # Back or middle rank: receive the handoff, run the layers this rank owns.
         h, residual = self._recv_handoff(ctx.batch.size)
-        output = self.model.forward(h=h, residual=residual)
-        return self.lm_head.forward(output)
+        out = self.model.forward(h=h, residual=residual)
+        if self.model.is_back:
+            # Back rank: the model returns the final hidden state (norm applied).
+            return self.lm_head.forward(out)
+        # Middle rank: the model returns (h, residual); hand off to the next rank.
+        h_out, residual_out = out
+        self._send_handoff(h_out, residual_out)
+        return None
 
     def _send_handoff(self, h: torch.Tensor, residual: torch.Tensor) -> None:
-        """Send (hidden, residual) to the back rank (rank world_size - 1)."""
-        back = self.world_size - 1
-        torch.distributed.send(h.detach().to("cpu"), dst=back, group=self.comm)
-        torch.distributed.send(residual.detach().to("cpu"), dst=back, group=self.comm)
+        """Send (hidden, residual) to the successor rank (rank + 1).
+
+        The activation flows forward down the PP chain: rank 0 -> 1 -> ... ->
+        N-1. For a 2-rank split the successor is the back rank (world_size - 1),
+        matching the original front->back handoff.
+        """
+        torch.distributed.send(h.detach().to("cpu"), dst=self.rank + 1, group=self.comm)
+        torch.distributed.send(residual.detach().to("cpu"), dst=self.rank + 1, group=self.comm)
 
     def _recv_handoff(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Receive (hidden, residual) from the front rank (rank 0)."""
+        """Receive (hidden, residual) from the predecessor rank (rank - 1)."""
         device = torch.cuda.current_device()
         h_cpu = torch.empty((n, self.config.hidden_size), dtype=self.dtype, device="cpu")
-        torch.distributed.recv(h_cpu, src=0, group=self.comm)
+        torch.distributed.recv(h_cpu, src=self.rank - 1, group=self.comm)
         residual_cpu = torch.empty((n, self.config.hidden_size), dtype=self.dtype, device="cpu")
-        torch.distributed.recv(residual_cpu, src=0, group=self.comm)
+        torch.distributed.recv(residual_cpu, src=self.rank - 1, group=self.comm)
         return h_cpu.to(device), residual_cpu.to(device)
 
     def send_tokens(self, tokens: torch.Tensor) -> None:
-        """Back rank: send the sampled tokens to the front rank (rank 0)."""
-        torch.distributed.send(tokens.detach().to("cpu"), dst=0, group=self.comm)
+        """Send the sampled tokens to the predecessor rank (rank - 1).
+
+        The next tokens flow backward up the PP chain: rank N-1 -> N-2 -> ...
+        -> 0. For a 2-rank split the predecessor is the front rank (rank 0).
+        """
+        torch.distributed.send(tokens.detach().to("cpu"), dst=self.rank - 1, group=self.comm)
 
     def recv_tokens(self, n: int) -> torch.Tensor:
-        """Front rank: receive the sampled tokens from the back rank."""
-        back = self.world_size - 1
+        """Receive the sampled tokens from the successor rank (rank + 1)."""
         tokens_cpu = torch.empty((n,), dtype=torch.int32, device="cpu")
-        torch.distributed.recv(tokens_cpu, src=back, group=self.comm)
+        torch.distributed.recv(tokens_cpu, src=self.rank + 1, group=self.comm)
         return tokens_cpu.to(torch.cuda.current_device())

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal
 
 import torch
 from minisgl.core import Batch, get_global_ctx
-from minisgl.distributed import get_tp_info
+from minisgl.distributed import get_shard_size
 from minisgl.env import ENV
 from minisgl.utils import div_even, init_logger
 
@@ -106,10 +106,12 @@ class FlashInferBackend(BaseAttnBackend):
         self.int_workspace_buffer = self.prefill_wrapper._int_workspace_buffer
         self.decode_wrappers._int_workspace_buffer = self.int_workspace_buffer
 
-        # initialize some data members
-        tp_size = get_tp_info().size
-        self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
-        self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
+        # initialize some data members. The head counts are sharded only by TP;
+        # in PP (layer split) mode each stage keeps the full qo/kv head count of
+        # the layers it owns (get_shard_size() == 1).
+        shard_size = get_shard_size()
+        self.qo_head_local = div_even(self.config.num_qo_heads, shard_size)
+        self.kv_head_local = div_even(self.config.num_kv_heads, shard_size, allow_replicate=True)
 
         self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
         # for cuda graph

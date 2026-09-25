@@ -7,7 +7,12 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple
 import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
-from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from minisgl.distributed import (
+    destroy_distributed,
+    enable_pynccl_distributed,
+    set_pp_info,
+    set_tp_info,
+)
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
@@ -55,6 +60,16 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        if config.uses_layer_split:
+            # PP is orthogonal to TP: the communication world is the PP world,
+            # but the sharding factor is 1 (each stage keeps the full head and
+            # weight count of every layer it owns). Components read the PP info
+            # via get_shard_size() / try_get_pp_info(), so set it here.
+            set_pp_info(
+                rank=config.tp_info.rank,
+                size=len(config.layer_split),
+                layer_split=config.layer_split,
+            )
         _adjust_config(config)
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
@@ -80,6 +95,7 @@ class Engine:
         # (hidden, residual) to the back rank, which samples and sends the
         # next tokens back.
         self.model.comm = self.tp_cpu_group
+        self.model.rank = config.tp_info.rank
         self.model.world_size = config.tp_info.size
         self.model.dtype = self.dtype
         self.model.load_state_dict(self._load_weight_state_dict(config))
@@ -307,17 +323,25 @@ class Engine:
         with self.ctx.forward_batch(batch):
             if self.config.uses_layer_split and self.config.is_front_rank:
                 # Front rank: run the embedding + the lower layers. The model's
-                # forward hands off (hidden, residual) to the back rank and
-                # returns None (no logits here). The back rank samples and
-                # sends the next tokens back.
+                # forward hands off (hidden, residual) to the next rank and
+                # returns None (no logits here). The back rank samples and the
+                # next tokens flow back up the chain.
                 self.model.forward()
                 next_tokens_gpu = self.model.recv_tokens(batch.size)
             elif self.config.uses_layer_split and self.config.is_back_rank:
                 # Back rank: receive the handoff, run the upper layers + the
                 # norm + the lm_head, sample, and send the next tokens to the
-                # front rank.
+                # predecessor rank.
                 logits = self.model.forward()
                 next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+                self.model.send_tokens(next_tokens_gpu)
+            elif self.config.uses_layer_split:
+                # Middle rank: receive the handoff from the predecessor, run
+                # the layers this rank owns, and hand off to the successor
+                # (the model's forward does the recv + run + send). Then relay
+                # the sampled tokens from the successor back to the predecessor.
+                self.model.forward()
+                next_tokens_gpu = self.model.recv_tokens(batch.size)
                 self.model.send_tokens(next_tokens_gpu)
             else:
                 # No split: run all layers + the norm + the lm_head. Sample.

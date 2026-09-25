@@ -1,6 +1,6 @@
 import torch
 from minisgl.core import get_global_ctx
-from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.distributed import DistributedCommunicator, get_shard_size
 from minisgl.utils import div_even
 
 from .base import BaseOP
@@ -25,8 +25,9 @@ class MoELayer(BaseOP):
         self.intermediate_size = intermediate_size
         self._comm = DistributedCommunicator()
 
-        tp_info = get_tp_info()
-        self.tp_size = tp_size = tp_info.size
+        # The expert intermediate size is sharded only by TP; in PP (layer
+        # split) mode each stage keeps the full expert weights.
+        self.tp_size = tp_size = get_shard_size()
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
