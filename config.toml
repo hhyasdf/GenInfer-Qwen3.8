@@ -51,8 +51,11 @@ min_p = 0.0
 max_running_requests = 1      # concurrency 1 (single-stream, no continuous batching)
 memory_ratio = 0.9            # fraction of GPU memory reserved for the KV cache
 page_size = 1                 # KV-cache page size (tokens per page)
-attention_backend = "fi"      # FlashInfer for the 16 full-attn layers (the GDN
-                              # 48 layers use the ported llama.cpp GDN kernel, not the seam)
+attention_backend = "triton_fa"  # Triton FA (vLLM pattern) for the 16 full-attn
+                              # layers. FlashInfer FA2 head_dim-256 prefill crashes
+                              # on sm_75; sgl-kernel/cuDNN/torch-SDPA reject sm_75.
+                              # The GDN 48 layers use the ported llama.cpp GDN
+                              # kernel, not the seam.
 cache_type = "naive"          # PagedAttention (not RadixAttention — no repeated prefixes)
 cuda_graph_max_bs = 1         # CUDA graphs for decode at concurrency 1 (launch-bound)
 max_prefill_length = 1024     # chunked-prefill chunk size (ubatch 1024, matches origin)

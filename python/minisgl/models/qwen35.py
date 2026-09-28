@@ -558,7 +558,10 @@ class Qwen35ForCausalLM(BaseLLMModel):
             self._send_handoff(h, residual)
             return None  # no logits on the front rank
         # Back or middle rank: receive the handoff, run the layers this rank owns.
-        h, residual = self._recv_handoff(ctx.batch.size)
+        # The activation has one row per TOKEN (input_ids), not per request:
+        # a prefill batch of 1 request can carry many tokens, so size the
+        # receive buffer by the token count, not by batch.size (req count).
+        h, residual = self._recv_handoff(ctx.batch.input_ids.shape[0])
         out = self.model.forward(h=h, residual=residual)
         if self.model.is_back:
             # Back rank: the model returns the final hidden state (norm applied).

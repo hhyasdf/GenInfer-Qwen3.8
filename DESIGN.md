@@ -11,7 +11,7 @@ this document records the deltas the profile demands.
   heads 24 / kv 4 / head_dim 256. Context 262144 (model max), vocab 248320.
 - **Precision**: main Q6_K, draft Q8_0, mmproj Q8_0 (GGUF-quantized, kept quantized —
   no dequantize-to-bf16; the 54 GB bf16 dequant does not fit 37.31 GiB).
-- **Hardware**: 2× PCIe GPU (4070 Ti Super sm_89 16 GB + 2080 Ti sm_86 22 GB), no NVLink.
+- **Hardware**: 2× PCIe GPU (4070 Ti Super sm_89 16 GB + 2080 Ti **sm_75** Turing 22 GB), no NVLink.
   37.31 GiB usable. Non-uniform layer split (more on the 2080 Ti).
 - **Use case**: OpenAI-compatible HTTP API, single user, consumer = **agent** (unlocks
   constrained decoding), latency-first.
@@ -22,13 +22,19 @@ this document records the deltas the profile demands.
 ## 2. Backend
 
 - **CUDA** (the scaffold is CUDA-only; the profile is 2× NVIDIA GPU).
-- **Attention backend seam** (`--attn`): `fi` (FlashInfer) for the **16 full-attn layers**
-  (the scaffold's serving default). The **48 GDN layers** do not use the seam — they use a
+- **Attention backend seam** (`--attn`): `triton_fa` (Triton FA, vLLM pattern) for the
+  **16 full-attn layers** (B3: the scaffold's `fi`/FlashInfer default is rejected on the
+  back rank — see §6). The **48 GDN layers** do not use the seam — they use a
   ported llama.cpp GDN (delta-net) CUDA kernel (see §6, build-vs-buy). The seam choice
   does not touch the GDN path.
-- **Heterogeneous sm_86 + sm_89**: the kernels must compile for both. FlashInfer and the
-  ported llama.cpp kernels are sm_86-compatible. Verify at B3 (the scaffold's toy model
-  runs on a single GPU; the 2-GPU path is new).
+- **Heterogeneous sm_75 + sm_89**: GPU0 = 4070 Ti Super (sm_89), GPU1 = 2080 Ti
+  (**sm_75 Turing**, compute_cap 7.5 — not sm_86 as B2 assumed). The kernels must compile
+  for both. This is why the attention backend is Triton FA: every flash-style fused
+  attention option is rejected on sm_75 (FlashInfer FA2 head_dim-256 prefill core-dumps;
+  sgl-kernel FA2/FA3 dispatch rejects "Ampere or newer"; cuDNN frontend SDPA requires
+  SM80+; torch SDPA rejects GQA and unequal-length in this build). Triton supports sm_75
+  and the ported llama.cpp GDN kernel runs on both. Verified at B3 (boot green on both
+  ranks; the 2-GPU layer-split path is new).
 
 ## 3. Model families (deltas from the scaffold)
 
@@ -92,7 +98,7 @@ is unsupported until DESIGN.md records its deltas and the class is registered"):
 | Component | Decision | Source / rationale |
 |---|---|---|
 | Tokenizer | **port** | GGUF-embedded gpt2 BPE; no HF tokenizer.json. Port the llama.cpp vocab loader (`src/vocab.cpp`). No community Python package reads GGUF vocab. |
-| Attention (full-attn, 16 layers) | **buy** | FlashInfer (`fi` backend, the scaffold's serving default). |
+| Attention (full-attn, 16 layers) | **build** | Triton FA (vLLM pattern), `triton_fa` backend. B3 rejected every community flash-style option on the back rank (GPU1 = sm_75 Turing): FlashInfer FA2 head_dim-256 prefill core-dumps (5 variants, identical crash); sgl-kernel FA2/FA3 dispatch rejects "Ampere or newer" for cc=(7,5); cuDNN frontend SDPA requires SM80+; torch SDPA rejects GQA and unequal-length in this build. Triton supports sm_75; the kernel is verified against an fp32 math reference on both GPUs (rel err ~2e-3) and boot-confirmed. |
 | Attention (GDN, 48 layers) | **port** | Port the llama.cpp GDN (delta-net) CUDA kernel (`src/models/delta-net-base.cpp` + the GDN kernels in `ggml-cuda`). No community Python package for GDN. |
 | GEMM (Q6_K weights) | **port** | Port the llama.cpp K-quants GEMM/GEMV kernels (`ggml-cuda`'s `mm` kernels for `Q6_K`). No community Python package for Q6_K GEMM. |
 | Norms (RMSNorm) | **buy** | torch (fused RMSNorm). The scaffold uses torch for norms. |
@@ -105,9 +111,12 @@ is unsupported until DESIGN.md records its deltas and the class is registered"):
 | Speculative decoding (dflash) | **port** | Port the dflash draft-verify scheduler from the llama.cpp `--spec-type draft-dflash` path. The scaffold lacks speculative decoding. |
 | Layer split (distributed mode) | **build** | New. The scaffold only has TP (NCCL all-reduce per layer). The profile needs a non-uniform layer split (activation handoff only, no per-layer all-reduce). See §8. |
 
-**Hand-rolled**: none. Every component is either a community implementation (buy) or a
-port of a reference-engine kernel (port). The reference oracle (B4) is hand-written f64
-by design (the correctness reference, not a performance component).
+**Hand-rolled**: the Triton FA kernel (full-attn) is the one build — justified because
+every community flash-style backend rejects sm_75 (the back rank), so no suitable
+community implementation exists for the target hardware (evidence above). Every other
+component is either a community implementation (buy) or a port of a reference-engine
+kernel (port). The reference oracle (B4) is hand-written f64 by design (the correctness
+reference, not a performance component).
 
 ## 7. Performance techniques (performance-design.md catalog, scenario-gated)
 

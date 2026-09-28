@@ -1,13 +1,14 @@
 # Phase
 track: build
-phase: B3
-status: in_progress
-note: B0/B1/B2 done; B3 = copy scaffold, fill config.toml, add qwen35/dflash/clip model classes, port K-quants GEMM + GDN kernels + q8_0 KV + vocab loader, add layer-split distributed mode + speculative decoding + constrained decoding
+phase: B4
+status: ready
+note: B0/B1/B2/B3 done; B4 = correctness: bake golden logits from the independent reference oracle, prove the engine matches layer-by-layer at bf16/fp32, then a short greedy. Blockers to clear first: bug B (ssm_conv1d garbage/zero weights in the GGUF), the logits[:batch.size] prefill-sampling question, and golden/logits.json is still the toy model's
 
 ## History
 - B0 done — model + checkpoint named; origin command confirmed verbatim (llama-server :8080, pid 4152); consumer=agent; bench=latency-1; vision in scope; spec-decode in scope; GGUF kept Q6_K (user ruling)
 - B1 done — SCENARIO.md complete format; capacity check corrected (draft KV was missing): 256k does not fit (40.29 GiB > 37.31), 100k fits (31.63 GiB); engine max context = 100k (scenario floor)
 - B2 done — DESIGN.md written; profile fully determines the design (B2 gate passed); 3 new model families (qwen35 GDN hybrid, dflash draft, clip mmproj); build-vs-buy table resolves every component; non-uniform layer split (not TP); GDN recurrent state update flagged as riskiest kernel
+- B3 done — real Qwen3.8-27B GGUF loads and serves on the layer-split (2-rank gloo) engine; 1-token chat completion answers (200 OK); startup log prints `stack:` and `allocation table:`; tensor inventory matches config. Attention backend = **Triton FA** (FlashInfer FA2 head_dim-256 prefill crashes on sm_75; sgl-kernel/cuDNN/torch-SDPA all reject sm_75 — see DESIGN.md build-vs-buy). Layer-split handoff fixed (back-rank recv sized by token count `input_ids.shape[0]`, not `batch.size` req count). `gates --phase B3` = ok. Known B4 blockers: bug B (ssm_conv1d garbage/zero in the GGUF), the `logits[:batch.size]` prefill-sampling question, golden/logits.json still the toy model's
 
 ## B0 intake (user-supplied, from SCENARIO.md)
 - model: Qwen3.8-27B GDN hybrid, GGUF arch `qwen35`, Q6_K 23.6 GB + dflash2 draft Q8_0 2.0 GB + mmproj Q8_0 0.6 GB, `~/Models/Qwen3.8-27B-EfficientThink-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2-GGUF/`
