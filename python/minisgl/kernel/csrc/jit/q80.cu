@@ -1,4 +1,4 @@
-// Q8_0 kernels for the qwen38-27b engine (dflash draft model).
+// Q8_0 kernels for the qwen38-27b engine (embedded MTP draft block blk.64).
 //
 // Q8_0 (llama.cpp / ggml): 32 elements per block, 34 bytes:
 //   ggml_half d; int8_t qs[32];

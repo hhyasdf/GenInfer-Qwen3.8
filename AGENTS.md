@@ -31,10 +31,10 @@ short greedy (`references/backends/cpu.md`).
 
 - **Model**: Qwen3.8-27B Gated-Delta-Net hybrid VLM (GGUF arch `qwen35`),
   64 layers = 48 GDN + 16 full-attn, hidden 5120, ctx 262144 (engine max
-  100k), vocab 248320. Weights Q6_K (main) + Q8_0 (dflash2 draft, mmproj
+  100k), vocab 248320, with the embedded MTP draft block (blk.64). Weights Q6_K (main, incl. the MTP block) + Q8_0 (mmproj
   Qwen3-VL ViT). GGUF-only checkpoint (no HF safetensors, no tokenizer.json).
 - **Hardware**: 2× PCIe GPU (no NVLink): 4070 Ti Super 16 GB (sm_89) +
-  2080 Ti 22 GB (sm_86, 700 MB display reserve). 37.31 GiB usable. 29 GB
+  2080 Ti 22 GB (sm_75, 700 MB display reserve). 37.31 GiB usable. 29 GB
   RAM. Toolkit: CUDA 13.0, driver 616.92.
 - **Use case**: OpenAI-compatible streaming HTTP API, single user,
   latency-first. The agent port (8080) already serves the origin
@@ -70,19 +70,19 @@ llama-server baseline on this suite to bind the agent port.
 
 - **Modules**: the minisgl package: server (frontend + scheduler +
   tokenizer/detokenizer workers), model (the qwen35 GDN-hybrid decoder + the
-  dflash draft + the Qwen3-VL vision tower), attention (the fi backend seam
+  embedded MTP draft block + the Qwen3-VL vision tower), attention (the fi backend seam
   for the 16 full-attn layers; the 48 GDN layers use the ported llama.cpp
   GDN kernel), cache (naive PagedAttention, q8_0 KV), sampler (torch +
   xgrammar constrained decoding), distributed (the non-uniform layer split).
 - **Data flow**: tokens → scheduler → model.forward (48 GDN + 16 full-attn
-  layers, split across 2 GPUs) → sampler → tokens. The draft model generates
-  up to 6 draft tokens per step; the main model verifies them (speculative
+  layers, split across 2 GPUs) → sampler → tokens. The MTP draft block generates
+  up to 4 draft tokens per step (`--spec-draft-n-max 4`); the main model verifies them (speculative
   decoding).
 - **Memory plan**: all regions pre-allocated once at startup — weights
-  23.07 GiB (main Q6_K 20.57 + draft Q8_0 1.92 + mmproj Q8_0 0.59, split
-  across 2 GPUs), KV 5.34 GiB @ 100k (main q8_0 3.43 + draft bf16 1.91),
+  22.17 GiB (main Q6_K 21.58, incl. the embedded MTP block, + mmproj Q8_0 0.59, split
+  across 2 GPUs), KV 3.64 GiB @ 100k (main q8_0 3.43 + MTP 1 full-attn layer q8_0 0.21),
   activation workspace 2 GiB, pinned host 0.2 GiB, graph pool 1 GiB, GDN
-  state 0.023 GiB (fixed). Total 31.63 GiB < 37.31 GiB usable. Never
+  state 0.023 GiB (fixed). Total 29.03 GiB < 37.31 GiB usable. Never
   reallocated in the serving loop.
 - **Batching**: single-stream (concurrency 1, no continuous batching) +
   chunked prefill (ubatch 1024) for the 60k inputs.
@@ -94,7 +94,7 @@ llama-server baseline on this suite to bind the agent port.
   llama.cpp q8_0 quant/dequant (port); tokenizer = ported llama.cpp vocab
   loader (port); norms/sampling = torch (buy); constrained decoding =
   xgrammar (buy); vision (Qwen3-VL ViT) = ported llama.cpp clip (port);
-  speculative decoding (dflash) = ported llama.cpp draft-verify (port);
+  speculative decoding (MTP) = ported llama.cpp draft-verify (port);
   layer split = new (build). Full table: `DESIGN.md` §6.
 
 Full design: `DESIGN.md`.
@@ -146,9 +146,22 @@ curl -sN localhost:<port>/v1/chat/completions -H 'content-type: application/json
 - `golden/` — the trusted reference artifact for `--selftest`.
 - `models/tiny-llama/` — the scaffold's toy model (the skill replaces it with
   the real checkpoint).
+- `hacks/` — ad-hoc test and debug scripts (per-family weight-load checks,
+  one-off probes); not part of the engine, run them from the engine root.
 - `logs/supervisor.log` — the supervisor's log (its lines + the child's
   output); the post-mortem for a dead session. Startup renames the previous
   file to `logs/supervisor.log.prev` and opens a fresh log.
+
+## Code search
+
+When your environment provides a codegraph-like code retrieval tool (symbol
+declarations, callers, what a change reaches, call paths), use it for
+structural questions instead of a grep-and-read loop: index the engine
+directory, query it, and refresh it after code changes. Grep stays the tool
+for literal text (strings, config values, log formats) and for the gaps the
+index cannot follow — untyped member calls and dynamic dispatch. Annotate the
+key seams (`self.engine: Engine`, `self.model: ...`) so the hot path stays
+traceable.
 
 ## Tuning protocol
 
