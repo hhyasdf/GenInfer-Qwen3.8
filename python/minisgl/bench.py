@@ -54,6 +54,17 @@ from minisgl.utils import cached_load_hf_config, init_logger, load_tokenizer
 logger = init_logger(__name__, "bench")
 
 
+def _baked_config() -> dict:
+    """Parse the engine's config.toml (``{}`` when absent)."""
+    config_path = Path(__file__).resolve().parents[2] / "config.toml"
+    if not config_path.is_file():
+        return {}
+    import tomllib
+
+    with open(config_path, "rb") as f:
+        return tomllib.load(f)
+
+
 def _resolve_dtype(model_path: str, dtype: str) -> torch.dtype:
     if dtype == "auto":
         return cached_load_hf_config(model_path).dtype
@@ -188,15 +199,25 @@ def _measure(base: str, model: str, args) -> dict | None:
         return None
 
     tics = [r.tics for r in raw_results]
-    if any(len(t) < 2 for t in tics):
-        logger.error("a measured request produced no token")
+    if any(len(t) < 3 for t in tics):
+        logger.error("a measured request produced fewer than 2 tokens; raise --new-tokens")
         return None
     ttft = sorted(t[1] - t[0] for t in tics)
-    tpot = sorted(d for t in tics for d in (t[i + 1] - t[i] for i in range(1, len(t) - 1)))
     e2e = sorted(t[-1] - t[0] for t in tics)
-    if not tpot:
-        logger.error("decode gaps are empty; raise --new-tokens above 1")
-        return None
+    # Per-request decode rate from the decode span: tokens between the first
+    # and the last, divided by the wall time between them. This is the number
+    # that survives a batched stream: a server that flushes streamed tokens in
+    # groups leaves runs of sub-millisecond gaps inside a flush and real
+    # waits between flushes, so the median of the raw inter-token gaps is the
+    # flush granularity, not the decode speed — it can exceed the p99 rate
+    # and any physical decode. The span rate is also the per-request figure
+    # the benchmark client (benchmark/client.py) already reports.
+    decode_rates = sorted(
+        (len(t) - 2) / max(t[-1] - t[1], 1e-9) for t in tics
+    )
+    # Raw inter-token gap distribution, diagnostic only (flush granularity,
+    # not decode speed).
+    itl = sorted(d for t in tics for d in (t[i + 1] - t[i] for i in range(1, len(t) - 1)))
     summary = {
         "suite": args.suite,
         "prompt_tokens": args.prompt_tokens,
@@ -205,9 +226,10 @@ def _measure(base: str, model: str, args) -> dict | None:
         "warmup": args.warmup,
         "ttft_p50_ms": round(_at(ttft, 0.50) * 1000, 3),
         "ttft_p99_ms": round(_at(ttft, 0.99) * 1000, 3),
-        "tpot_p50_ms": round(_at(tpot, 0.50) * 1000, 3),
-        "decode_tok_s_p50": round(1.0 / _at(tpot, 0.50), 3),
-        "decode_tok_s_p99": round(1.0 / _at(tpot, 0.99), 3),
+        "decode_tok_s_p50": round(_at(decode_rates, 0.50), 3),
+        "decode_tok_s_p99": round(_at(decode_rates, 0.99), 3),
+        "itl_p50_ms": round(_at(itl, 0.50) * 1000, 3),
+        "itl_p99_ms": round(_at(itl, 0.99) * 1000, 3),
         "e2e_p50_s": round(_at(e2e, 0.50), 3),
         "e2e_p99_s": round(_at(e2e, 0.99), 3),
     }
@@ -216,6 +238,20 @@ def _measure(base: str, model: str, args) -> dict | None:
 
 
 def run_bench(argv: List[str] | None = None) -> int:
+    # The bench talks only to a local service (the already-up server at
+    # --base-url, or the one it launches itself). It must never route through
+    # an ambient HTTP_PROXY, and the openai client (httpx) crashes while
+    # parsing a malformed no_proxy entry (a bracketed IPv6 literal such as
+    # [::1]) when it builds the proxy-bypass set at construction time. Strip
+    # the proxy env so the client connects directly and no_proxy is never
+    # parsed, regardless of how the bench is launched (supervisor or tuner).
+    import os as _os
+    for _v in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+               "http_proxy", "https_proxy", "all_proxy"):
+        _os.environ.pop(_v, None)
+    _os.environ["no_proxy"] = "*"
+    _os.environ["NO_PROXY"] = "*"
+
     parser = argparse.ArgumentParser(
         prog="python -m minisgl --bench",
         description="Fixed benchmark harness over the full serving stack.",
@@ -223,10 +259,19 @@ def run_bench(argv: List[str] | None = None) -> int:
     parser.add_argument("--model-path", required=True, help="local model dir or HF model id")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=1919)
-    parser.add_argument("--dtype", default="auto", help="auto | float16 | bfloat16 | float32")
+    cfg = _baked_config()
+    parser.add_argument(
+        "--dtype",
+        default=cfg.get("engine", {}).get("dtype", "auto"),
+        help="auto | float16 | bfloat16 | float32 (default: config.toml [engine].dtype, or 'auto')",
+    )
     parser.add_argument("--tp", type=int, default=1, help="tensor parallelism size")
     parser.add_argument("--cache-type", default="radix", choices=["radix", "naive"])
-    parser.add_argument("--attention-backend", default="auto", help="auto | fa | fi | trtllm")
+    parser.add_argument(
+        "--attention-backend",
+        default=cfg.get("performance", {}).get("attention_backend", "auto"),
+        help="auto | fa | fi | trtllm (default: config.toml [performance].attention_backend, or 'auto')",
+    )
     parser.add_argument("--cuda-graph-max-bs", type=int, default=None)
     parser.add_argument("--max-running-requests", type=int, default=256)
     parser.add_argument("--memory-ratio", type=float, default=0.9)
@@ -276,6 +321,12 @@ def run_bench(argv: List[str] | None = None) -> int:
             logger.error("server at %s did not complete a 1-token chat", base)
             return 1
         return 0 if _measure(base, model, args) else 1
+
+    # Own-server branch: this bench loads a model and binds args.port. The
+    # preflight guard refuses to start beside a service that already serves.
+    from minisgl.server.launch import agent_port_guard
+
+    agent_port_guard(args.port, logger)
 
     dtype = _resolve_dtype(args.model_path, args.dtype)
     server_args = ServerArgs(

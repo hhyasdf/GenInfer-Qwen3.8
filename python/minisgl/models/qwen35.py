@@ -12,8 +12,8 @@ GDN layer (48 layers, Q6_K weights):
     ssm_conv1d     [10240, 4]      depthwise causal conv (F32)
     ssm_dt.bias    [48]            dt bias (F32)
     ssm_a          [48]            decay rate, negative (F32)
-    ssm_alpha      [48, 5120]      alpha projection (Q6_K)
-    ssm_beta       [48, 5120]      beta projection (Q6_K)
+    ssm_alpha      [48, 5120]      alpha projection (BF16)
+    ssm_beta       [48, 5120]      beta projection (BF16)
     ssm_norm       [128]           per-v-head RMSNorm (F32)
     ssm_out        [5120, 6144]    output projection (Q6_K)
     ffn_gate/up    [17408, 5120]   MLP gate/up (Q6_K)
@@ -34,9 +34,13 @@ Full-attn layer (16 layers, Q6_K weights):
     post_attention_norm [5120]     post-attn RMSNorm (F32)
 
 Global:
-    token_embd     [248320, 5120]  embedding (Q6_K)
-    output         [248320, 5120]  lm_head (Q6_K)
+    token_embd     [248320, 5120]  embedding (Q8_0)
+    output         [248320, 5120]  lm_head (Q8_0)
     output_norm    [5120]          final RMSNorm (F32)
+
+MTP block (blk.64, Q8_0 weights, lives on the back rank):
+    attn_q/k/v, attn_output, ffn_gate/up/down, eh_proj (all Q8_0)
+    token_embd and lm_head are shared with the main model (Q8_0)
 
 Q6_K weights are kept as raw uint8 bytes (210 B per 256-element block) and
 dequantized in registers by the Q6_K GEMV/GEMM/gather kernels, so every
@@ -52,6 +56,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -61,9 +66,11 @@ from minisgl.core import get_global_ctx
 from minisgl.layers import (
     BaseOP,
     OPList,
-    Q6KEmbedding,
-    Q6KLMHead,
+    LinearReplicated,
     Q6KLinear,
+    Q80Embedding,
+    Q80LMHead,
+    Q80Linear,
     RMSNorm,
     RMSNormFused,
 )
@@ -93,7 +100,9 @@ class GDNLayer(BaseOP):
           z         = attn_gate @ x         [n, 6144]
           beta      = sigmoid(ssm_beta @ x) [n, 48]
           alpha     = ssm_alpha @ x         [n, 48]
-          gate      = softplus(alpha + ssm_dt) * ssm_a   [n, 48]  (negative)
+          gate      = ssm_a * softplus(alpha + ssm_dt)          [n, 48]  (negative)
+                      # ssm_a = -exp(A_log) (pre-transformed by the conversion
+                      # script); HF: g = -A_log.exp()*softplus
       2. causal depthwise conv1d (kernel 4) on qkv_mixed, then silu
       3. split q [n,16,128], k [n,16,128], v [n,48,128]; L2-norm q,k
       4. repeat q,k from 16 k-heads to 48 v-heads
@@ -102,7 +111,7 @@ class GDNLayer(BaseOP):
             S  = S * exp(gate)
             sk = S @ k
             d  = (v - sk) * beta
-            S  = S + outer(k, d)
+            S  = S + outer(d, k)   # S[value, key] += d[value] * k[key]
             o  = S @ (q * scale)
       6. out = RMSNorm(o, ssm_norm) * silu(z)
       7. final = ssm_out @ out             [n, 5120]
@@ -130,8 +139,13 @@ class GDNLayer(BaseOP):
         # Projections (Q6_K in the GGUF; kept as raw bytes)
         self.attn_qkv = Q6KLinear(hidden, conv_channels)
         self.attn_gate = Q6KLinear(hidden, d_inner)
-        self.ssm_beta = Q6KLinear(hidden, num_v)
-        self.ssm_alpha = Q6KLinear(hidden, num_v)
+        # BF16 in the GGUF (GGML type 30): the converter kept these two small
+        # [48, 5120] projections unquantized. Plain F.linear with bfloat16
+        # weights — the loader keeps them bfloat16 (no cast) and the
+        # activation is bf16, so F.linear needs a same-dtype weight. 48x5120
+        # GEMMs are compute-negligible next to the Q6_K GEMMs in the layer.
+        self.ssm_beta = LinearReplicated(hidden, num_v, has_bias=False, dtype=torch.bfloat16)
+        self.ssm_alpha = LinearReplicated(hidden, num_v, has_bias=False, dtype=torch.bfloat16)
         self.ssm_out = Q6KLinear(d_inner, hidden)
 
         # Conv (F32 in the GGUF)
@@ -156,6 +170,9 @@ class GDNLayer(BaseOP):
         z = self.attn_gate(x)  # [n, 6144]
         beta = torch.sigmoid(self.ssm_beta(x))  # [n, 48]
         alpha = self.ssm_alpha(x)  # [n, 48]
+        # GDN gate: ssm_a * softplus(alpha + dt).  The GGUF stores the
+        # pre-transformed -exp(A_log) (the conversion script applies
+        # -torch.exp(A_log)), so this equals HF's g = -A_log.exp()*softplus.
         gate = F.softplus(alpha + self.ssm_dt) * self.ssm_a  # [n, 48]
 
         # 2. Causal depthwise conv1d (kernel 4) + silu
@@ -228,27 +245,33 @@ class _PartialRope:
     (n_rot=64) degenerates to standard RoPE on the first 64 dims of each
     256-dim q/k head; the remaining 192 dims are passed through unchanged.
 
+    The rotation pairs dim ``i`` with dim ``i + rotary_dim/2`` (i.e. (i, i+32)
+    for i in [0, 32)), the same convention as llama.cpp's GGML_ROPE_TYPE_MROPE
+    (``rotate_pairs`` with n_offset = n_dims/2) and HF's ``rotate_half``. The
+    remaining dims [rotary_dim, head_size) are passed through unchanged.
+
+    Implementation: flashinfer's Neox RoPE pairs dim i with i + head_size/2, so
+    to get the (i, i+32) pairing we run it with head_size = rotary_dim (64) on
+    the first 64 dims of each head and concatenate the untouched [64, 256) tail.
+
     Instances are shared across all full-attn layers via ``get_partial_rope``
     (one cos/sin cache per (head_size, rotary_dim, max_position, base)).
     """
 
     def __init__(self, head_size: int, rotary_dim: int, max_position: int, base: float):
         self.head_size = head_size
+        self.rotary_dim = rotary_dim
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position, dtype=torch.float)
         freqs = torch.einsum("i,j->ij", t, inv_freq)  # [max_pos, rotary_dim/2]
         cos = freqs.cos()
         sin = freqs.sin()
-        # Pad to head_size/2: real values for the first rotary_dim/2 pairs,
-        # cos=1 / sin=0 (pass-through) for the rest.
+        # Real cos/sin for the rotary_dim/2 pairs. The RoPE op runs with
+        # head_size = rotary_dim, so the cache is [max_pos, rotary_dim]
+        # (cos | sin, no pass-through padding — the tail is handled separately).
         # Explicit float32: the engine builds the model under
         # set_default_dtype(bfloat16), and flashinfer requires an f32 cache.
-        half = head_size // 2
-        cos_full = torch.ones(max_position, half, dtype=torch.float32)
-        cos_full[:, : rotary_dim // 2] = cos
-        sin_full = torch.zeros(max_position, half, dtype=torch.float32)
-        sin_full[:, : rotary_dim // 2] = sin
-        self._cos_sin_cache = torch.cat((cos_full, sin_full), dim=-1)  # [max_pos, head_size]
+        self._cos_sin_cache = torch.cat((cos, sin), dim=-1).to(torch.float32)  # [max_pos, rotary_dim]
 
         from flashinfer import apply_rope_with_cos_sin_cache_inplace
 
@@ -256,13 +279,24 @@ class _PartialRope:
 
     def forward(self, positions, q: torch.Tensor, k: torch.Tensor):
         # q: [n, num_qo_heads, head_size], k: [n, num_kv_heads, head_size]
+        # Rotate the first rotary_dim dims of each head (head_size = rotary_dim
+        # for the RoPE op, pairing (i, i + rotary_dim/2)); pass through the
+        # remaining [rotary_dim, head_size) dims.
+        n, hq, _ = q.shape
+        n_, hk, _ = k.shape
+        q_rot = q[..., : self.rotary_dim].contiguous().view(n, hq * self.rotary_dim)
+        k_rot = k[..., : self.rotary_dim].contiguous().view(n_, hk * self.rotary_dim)
         self._apply(
             positions=positions,
-            query=q,
-            key=k,
-            head_size=self.head_size,
+            query=q_rot,
+            key=k_rot,
+            head_size=self.rotary_dim,
             cos_sin_cache=self._cos_sin_cache,
         )
+        q_rot = q_rot.view(n, hq, self.rotary_dim)
+        k_rot = k_rot.view(n_, hk, self.rotary_dim)
+        q = torch.cat([q_rot, q[..., self.rotary_dim :]], dim=-1)
+        k = torch.cat([k_rot, k[..., self.rotary_dim :]], dim=-1)
         return q, k
 
 
@@ -292,8 +326,9 @@ class Qwen35FullAttn(BaseOP):
     Forward (from llama.cpp qwen35.cpp build_layer_attn):
 
       1. QG = attn_q @ x                [n, 12288]
-          q  = QG[:, :6144]              [n, 24, 256]
-          gate = QG[:, 6144:]            [n, 24, 256]
+          per-head interleaved split (each 512-dim head = [256 Q | 256 gate]):
+          q    = QG.view(n, 24, 512)[..., :256]    [n, 24, 256]
+          gate = QG.view(n, 24, 512)[..., 256:]    [n, 24, 256]
       2. q = per-head RMSNorm(q, attn_q_norm [256])
       3. k = attn_k @ x                 [n, 4, 256]
           k = per-head RMSNorm(k, attn_k_norm [256])
@@ -345,10 +380,15 @@ class Qwen35FullAttn(BaseOP):
         ctx = get_global_ctx()
         n = x.shape[0]
 
-        # 1. QG projection + split
+        # 1. QG projection + per-head interleaved split.
+        #    llama.cpp (qwen35.cpp build_layer_attn): Qcur_full is [12288, n];
+        #    Qcur  = view with head-stride 2*head_dim, offset 0      (first 256 of each 512-dim head)
+        #    gate  = view with head-stride 2*head_dim, offset head_dim (second 256 of each 512-dim head)
+        #    So within each 512-dim head: [0:256]=Q, [256:512]=gate. NOT a global split.
         qg = self.attn_q(x)  # [n, 12288]
-        q = qg[:, : self.num_qo * self.head_dim].view(n, self.num_qo, self.head_dim)
-        gate = qg[:, self.num_qo * self.head_dim :].view(n, self.num_qo, self.head_dim)
+        qg = qg.view(n, self.num_qo, 2 * self.head_dim)  # [n, 24, 512]
+        q = qg[:, :, : self.head_dim]  # [n, 24, 256]
+        gate = qg[:, :, self.head_dim :]  # [n, 24, 256]
 
         # 2. Per-head q norm
         q = self.attn_q_norm(q)
@@ -371,6 +411,24 @@ class Qwen35FullAttn(BaseOP):
 
         # 7. Sigmoid gate
         o = o * torch.sigmoid(gate)
+
+        # DEBUG: dump layer-3 intermediates for f64-ref comparison
+        import os as _os
+        if _os.environ.get("QWEN35_DEBUG_L3") and self.layer_id == 3:
+            import torch as _t
+            _d = _t.save if False else None
+            _out = {
+                "x": x.detach().float().cpu(),
+                "qg": qg.detach().float().cpu(),
+                "q": q.detach().float().cpu(),
+                "k": k.detach().float().cpu(),
+                "v": v.detach().float().cpu(),
+                "gate": gate.detach().float().cpu(),
+                "o": o.detach().float().cpu(),
+                "positions": ctx.batch.positions.detach().cpu(),
+            }
+            _t.save(_out, "/tmp/bisect/eng_l3_inter.pt")
+            print(f"[DEBUG] dumped layer-3 intermediates", flush=True)
 
         # 8. Output projection
         return self.attn_output(o.view(n, -1))  # [n, 5120]
@@ -454,7 +512,7 @@ class Qwen35Model(BaseOP):
         self.is_front = self.layer_range[0] == 0
         self.is_back = self.layer_range[1] == config.num_layers
         self.embed = (
-            Q6KEmbedding(config.vocab_size, config.hidden_size) if self.is_front else None
+            Q80Embedding(config.vocab_size, config.hidden_size) if self.is_front else None
         )
         self.layers = OPList(
             [
@@ -515,6 +573,173 @@ class Qwen35Model(BaseOP):
         return h, residual
 
 
+class MTPBlock(BaseOP):
+    """MTP (multi-token-prediction) draft block.
+
+    A single full-attention decoder layer plus a nextn head. It drafts the next
+    token from (sampled token, hidden state) using the main model's embedding
+    and lm_head. The MTP block lives on the back rank (GPU1) alongside the
+    upper layers and the lm_head.
+
+    Forward (from llama.cpp qwen35.cpp graph_mtp):
+      1. tok_embd = embed(input_token)              [n, 5120]
+      2. h_norm   = RMSNorm(hidden_state, hnorm)    [n, 5120]
+      3. e_norm   = RMSNorm(tok_embd, enorm)        [n, 5120]
+      4. concat   = concat(e_norm, h_norm, dim=0)   [2*5120, n]
+      5. cur      = eh_proj @ concat                [5120, n]
+      6. inpSA    = cur  (residual)
+      7. cur      = RMSNorm(cur, attn_norm)
+      8. QG, K, V = full-attn projections (same as Qwen35FullAttn)
+      9. cur      = attention(Q, K, V) * sigmoid(gate)
+     10. cur      = attn_output @ cur
+     11. cur      = cur + inpSA
+     12. cur      = MLP(RMSNorm(cur, post_attention_norm)) + cur
+     13. cur      = RMSNorm(cur, shared_head_norm)
+     14. logits   = lm_head @ cur                   [vocab, n]
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        hidden = config.hidden_size  # 5120
+        # Full-attn projections (Q8_0 for MTP block)
+        head_dim = config.head_dim  # 256
+        num_qo = config.num_qo_heads  # 24
+        num_kv = config.num_kv_heads  # 4
+        qo_dim = num_qo * head_dim  # 6144
+        kv_dim = num_kv * head_dim  # 1024
+
+        self.attn_q = Q80Linear(hidden, 2 * qo_dim)  # [12288, 5120]
+        self.attn_k = Q80Linear(hidden, kv_dim)  # [1024, 5120]
+        self.attn_v = Q80Linear(hidden, kv_dim)  # [1024, 5120]
+        self.attn_output = Q80Linear(qo_dim, hidden)  # [5120, 6144]
+        self.attn_q_norm = RMSNorm(head_dim, config.rms_norm_eps)  # [256]
+        self.attn_k_norm = RMSNorm(head_dim, config.rms_norm_eps)  # [256]
+
+        # MLP (Q8_0 for MTP block)
+        ffn = config.intermediate_size  # 17408
+        self.ffn_gate = Q80Linear(hidden, ffn)  # [17408, 5120]
+        self.ffn_up = Q80Linear(hidden, ffn)  # [17408, 5120]
+        self.ffn_down = Q80Linear(ffn, hidden)  # [5120, 17408]
+
+        # Layer norms (F32)
+        self.input_layernorm = RMSNormFused(hidden, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNormFused(hidden, config.rms_norm_eps)
+
+        # Nextn head (F32 norms, Q8_0 eh_proj)
+        self.eh_proj = Q80Linear(2 * hidden, hidden)  # [10240, 5120]
+        self.enorm = RMSNorm(hidden, config.rms_norm_eps)  # [5120]
+        self.hnorm = RMSNorm(hidden, config.rms_norm_eps)  # [5120]
+        self.shared_head_norm = RMSNorm(hidden, config.rms_norm_eps)  # [5120]
+
+        # Partial RoPE (n_rot = 64 of head_dim = 256), shared across layers
+        self.rotary = get_partial_rope(
+            head_size=head_dim,
+            rotary_dim=config.rotary_config.rotary_dim,  # 64
+            max_position=config.rotary_config.max_position,
+            base=config.rotary_config.base,  # 1e7
+        )
+
+        self.head_dim = head_dim
+        self.num_qo = num_qo
+        self.num_kv = num_kv
+
+    def forward(
+        self,
+        input_token: torch.Tensor,
+        hidden_state: torch.Tensor,
+        embed: Q80Embedding,
+        lm_head: Q80LMHead,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one MTP draft step.
+
+        Args:
+            input_token: the sampled token from the previous step [n]
+            hidden_state: the hidden state from the main model's last layer [n, 5120]
+            embed: the main model's embedding (shared)
+            lm_head: the main model's lm_head (shared)
+
+        Returns:
+            (logits, h_nextn): the logits for the next token [vocab, n] and the
+            hidden state for the next MTP step [n, 5120].
+        """
+        ctx = get_global_ctx()
+        n = input_token.shape[0]
+
+        # 1. Embed the input token
+        tok_embd = embed.forward(input_token)  # [n, 5120]
+
+        # 2-3. Normalize the hidden state and the token embedding
+        h_norm = self.hnorm(hidden_state)  # [n, 5120]
+        e_norm = self.enorm(tok_embd)  # [n, 5120]
+
+        # 4. Concatenate and project
+        concat = torch.cat([e_norm, h_norm], dim=0)  # [2*5120, n]
+        cur = self.eh_proj(concat)  # [5120, n]
+
+        # 5-6. Residual
+        inpSA = cur
+
+        # 7. Input layernorm
+        cur = self.input_layernorm(cur)  # [5120, n]
+
+        # 8. Full-attn projections
+        qg = self.attn_q(cur)  # [n, 12288]
+        qg = qg.view(n, self.num_qo, 2 * self.head_dim)  # [n, 24, 512]
+        q = qg[:, :, : self.head_dim]  # [n, 24, 256]
+        gate = qg[:, :, self.head_dim :]  # [n, 24, 256]
+
+        q = self.attn_q_norm(q)  # [n, 24, 256]
+        k = self.attn_k(cur).view(n, self.num_kv, self.head_dim)  # [n, 4, 256]
+        k = self.attn_k_norm(k)  # [n, 4, 256]
+        v = self.attn_v(cur)  # [n, kv_dim]
+
+        # 9. Attention (no KV cache for MTP draft — single-step attention)
+        q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        o = self._attention(q, k, v)  # [n, 24, 256]
+        o = o * torch.sigmoid(gate)  # [n, 24, 256]
+        o = o.view(n, -1)  # [n, 6144]
+        cur = self.attn_output(o)  # [n, 5120]
+
+        # 10-11. Residual
+        cur = cur + inpSA  # [n, 5120]
+
+        # 12. MLP
+        ffn_residual = cur
+        cur = self.post_attention_layernorm(cur)  # [n, 5120]
+        gate = self.ffn_gate(cur)  # [n, ffn]
+        up = self.ffn_up(cur)  # [n, ffn]
+        cur = F.silu(gate) * up  # [n, ffn]
+        cur = self.ffn_down(cur)  # [n, 5120]
+        cur = cur + ffn_residual  # [n, 5120]
+
+        # 13. Shared head norm
+        cur = self.shared_head_norm(cur)  # [n, 5120]
+
+        # 14. LM head
+        logits = lm_head.forward(cur)  # [vocab, n]
+
+        return logits, cur
+
+    def _attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """Single-step attention (no KV cache). q [n, 24, 256], k [n, 4, 256],
+        v [n, 1024]. Returns [n, 24, 256]."""
+        # Scale
+        scale = 1.0 / math.sqrt(self.head_dim)
+        # q [n, 24, 256], k [n, 4, 256] -> broadcast k to 24 heads
+        k = k.repeat_interleave(self.num_qo // self.num_kv, dim=1)  # [n, 24, 256]
+        v = v.view(-1, self.num_kv, self.head_dim).repeat_interleave(
+            self.num_qo // self.num_kv, dim=1
+        )  # [n, 24, 256]
+        # Attention scores
+        scores = torch.bmm(q, k.transpose(1, 2)) * scale  # [n, 24, 256]
+        # No mask (single-step)
+        attn = torch.softmax(scores, dim=-1)  # [n, 24, 256]
+        o = torch.bmm(attn, v.transpose(1, 2))  # [n, 24, 256]
+        return o
+
+
 class Qwen35ForCausalLM(BaseLLMModel):
     """Qwen3.5 GDN-hybrid causal LM (model + lm_head).
 
@@ -522,13 +747,18 @@ class Qwen35ForCausalLM(BaseLLMModel):
     lower layers; the back rank holds the upper layers, the final norm, and the
     lm_head. The front rank hands off (hidden, residual) to the back rank; the
     back rank samples and sends the next tokens back to the front rank.
+
+    When MTP is enabled (config.mtp_enabled), the back rank also holds the MTP
+    draft block (blk.64) and the speculative decoding logic.
     """
 
     def __init__(self, config, layer_range: tuple[int, int] | None = None):
         super().__init__()
         self.model = Qwen35Model(config, layer_range=layer_range)
-        self.lm_head = Q6KLMHead(config.vocab_size, config.hidden_size) if self.model.is_back else None
+        self.lm_head = Q80LMHead(config.vocab_size, config.hidden_size) if self.model.is_back else None
         self.config = config
+        # MTP draft block (only on the back rank when MTP is enabled)
+        self.mtp = MTPBlock(config) if (config.mtp_enabled and self.model.is_back) else None
         # Set by the engine after the communication group is set up.
         self.comm = None
         self.rank = 0
@@ -546,12 +776,24 @@ class Qwen35ForCausalLM(BaseLLMModel):
         """
         self.model.reset_gdn_state(device, dtype)
 
+    def _maybe_dump(self, hidden: torch.Tensor, logits: torch.Tensor) -> None:
+        if not os.environ.get("MINISGL_DUMP"):
+            return
+        d = {"hidden": hidden.detach().cpu(), "logits": logits.detach().cpu()}
+        if self.lm_head is not None:
+            # Raw Q6_K bytes of the first 16 lm_head rows, so the f64 oracle
+            # can byte-compare the engine's loaded weight against the GGUF.
+            d["lm_head_w16"] = self.lm_head.weight[:16].detach().cpu()
+        torch.save(d, "/tmp/engine_dump.pt")
+
     def forward(self) -> torch.Tensor | None:
         ctx = get_global_ctx()
         if self.model.is_front and self.model.is_back:
             # No split: run all layers + the norm + the lm_head.
             output = self.model.forward(ctx.batch.input_ids)
-            return self.lm_head.forward(output)
+            logits = self.lm_head.forward(output)
+            self._maybe_dump(output, logits)
+            return logits
         if self.model.is_front:
             # Front rank: run the embedding + the lower layers. Hand off.
             h, residual = self.model.forward(ctx.batch.input_ids)
@@ -565,7 +807,9 @@ class Qwen35ForCausalLM(BaseLLMModel):
         out = self.model.forward(h=h, residual=residual)
         if self.model.is_back:
             # Back rank: the model returns the final hidden state (norm applied).
-            return self.lm_head.forward(out)
+            logits = self.lm_head.forward(out)
+            self._maybe_dump(out, logits)
+            return logits
         # Middle rank: the model returns (h, residual); hand off to the next rank.
         h_out, residual_out = out
         self._send_handoff(h_out, residual_out)

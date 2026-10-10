@@ -40,6 +40,11 @@ class EngineConfig:
     layer_split: Tuple[int, ...] | None = None
     # The cuda device index that hosts the draft model (speculative decoding).
     draft_device: int | None = None
+    # Explicit device override (e.g. "cuda:1"). When None, the device is
+    # derived from the rank (cuda:<rank>), which is correct for the normal
+    # multi-process PP/TP startup. The single-process selftest sets this to
+    # load the full model on a specific GPU when it does not fit on cuda:0.
+    device: str | None = None
 
     @property
     def uses_layer_split(self) -> bool:

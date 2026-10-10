@@ -39,34 +39,26 @@ import torch
 
 
 def _build_byte_map() -> dict[int, str]:
-    """Build the gpt2 byte->fallback-char map (243 valid-UTF-8 bytes).
+    """Build the gpt2 byte->fallback-char map (all 256 bytes).
 
-    The 13 missing bytes (0xC0, 0xC1, 0xF5-0xFF) are invalid UTF-8 lead bytes
-    and never appear in valid text. Each byte maps to a single fallback char.
+    The `tokenizers` ByteLevel pre-tokenizer uses gpt2's bytes_to_unicode:
+    the 124 "present" bytes (0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF) map to chr(b),
+    and the other 132 map to chr(256 + n) (U+0100-U+017B, in ascending byte
+    order). That includes the 13 invalid UTF-8 lead bytes (0xC0, 0xC1,
+    0xF5-0xFF): they never occur in valid text, but GGUF BPE tokens can hold
+    their fallback chars (e.g. 0xFB -> 'û'), so the map must cover all 256
+    bytes or decode() raises KeyError on a token that contains one.
     """
-    from tokenizers import pre_tokenizers
-
-    bl = pre_tokenizers.ByteLevel(use_regex=False, add_prefix_space=False)
+    present = (set(range(0x21, 0x7F))
+               | set(range(0xA1, 0xAD))
+               | set(range(0xAE, 0x100)))
+    missing = [b for b in range(256) if b not in present]
     byte_to_char: dict[int, str] = {}
-    # b < 128: chr(b) is a single byte in UTF-8, so pre_tokenize_str gives
-    # the fallback char directly (space -> 'Ġ', NUL -> 'Ā', etc.).
-    for b in range(128):
-        enc = bl.pre_tokenize_str(chr(b))[0][0]
-        assert len(enc) == 1, f"byte {b:#04x} -> {enc!r} not a single char"
-        byte_to_char[b] = enc
-    # b >= 128: chr(b) is not a single byte, so iterate codepoints and zip
-    # their UTF-8 bytes with the byte-level fallback chars.
-    for cp in range(0x80, 0x110000):
-        if len(byte_to_char) == 256:
-            break
-        if 0xD800 <= cp <= 0xDFFF:
-            continue
-        s = chr(cp)
-        enc = bl.pre_tokenize_str(s)[0][0]
-        utf8 = s.encode("utf-8")
-        for b, ch in zip(utf8, enc):
-            if b not in byte_to_char:
-                byte_to_char[b] = ch
+    for b in range(256):
+        if b in present:
+            byte_to_char[b] = chr(b)
+        else:
+            byte_to_char[b] = chr(2**8 + missing.index(b))
     return byte_to_char
 
 
@@ -87,7 +79,10 @@ class GGUFBPETokenizer:
         self.eos_id: int = metadata["tokenizer.ggml.eos_token_id"]
         self.padding_id: int = metadata["tokenizer.ggml.padding_token_id"]
         self.mask_id: int = metadata.get("tokenizer.ggml.mask_token_id", -1)
-        self.add_bos: bool = metadata["tokenizer.ggml.add_bos_token"]
+        # Optional in the GGUF spec (bool, default false). Merged checkpoints
+        # may omit it; Qwen tokenizers do not prepend BOS, and the golden ids
+        # were produced without one, so the spec default is the right fallback.
+        self.add_bos: bool = metadata.get("tokenizer.ggml.add_bos_token", False)
         self.chat_template: str = metadata["tokenizer.chat_template"]
 
         # token (byte-level string) -> GGUF token id

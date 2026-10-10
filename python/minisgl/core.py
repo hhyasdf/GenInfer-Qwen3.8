@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal
+from typing import TYPE_CHECKING, Callable, List, Literal
 
 import torch
 
@@ -109,17 +109,35 @@ class Context:
     # Per-request recurrent state for GDN (linear-attention) layers, set by
     # models that need it (e.g. qwen35). Maps layer_id -> state object.
     gdn_state: dict | None = field(default=None, init=False)
+    # Zeroes the GDN recurrent state (wired by the engine for models that have
+    # one). The state is a single global per-layer tensor updated in place by
+    # the GDN kernel, so it carries the previous request's final recurrence
+    # into the next request unless zeroed at the request boundary.
+    gdn_reset_fn: Callable[[], None] | None = field(default=None, init=False)
+    # Set by request_gdn_reset(); consumed by the next prefill forward.
+    _gdn_needs_reset: bool = field(default=False, init=False)
 
     @property
     def batch(self) -> Batch:
         assert self._batch is not None, "No active batch in context"
         return self._batch
 
+    def request_gdn_reset(self) -> None:
+        """Mark the GDN recurrent state stale: it is zeroed before the next
+        prefill forward. Call this once per new request — NOT on every prefill
+        batch, because chunked prefill splits one request across several
+        prefill batches and the delta-rule recurrence must continue across
+        them (resetting between chunks would restart it from zero)."""
+        self._gdn_needs_reset = True
+
     @contextmanager
     def forward_batch(self, batch: Batch):
         assert self._batch is None, "Nested forward_batch is not allowed"
         try:
             self._batch = batch
+            if batch.is_prefill and self._gdn_needs_reset and self.gdn_reset_fn is not None:
+                self.gdn_reset_fn()
+                self._gdn_needs_reset = False
             yield
         finally:
             self._batch = None

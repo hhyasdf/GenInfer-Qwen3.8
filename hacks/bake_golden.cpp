@@ -18,6 +18,7 @@
 //       -I/home/hhy/Projects/llama.cpp/ggml/include \
 //       bake_golden.cpp -o bake_golden \
 //       -L/home/hhy/Projects/llama.cpp/build/bin -l:libllama.so.0 \
+//       -l:libggml.so.0 \
 //       -Wl,-rpath,/home/hhy/Projects/llama.cpp/build/bin
 //
 // Run (as a gpu-job, since the origin holds the GPU):
@@ -311,18 +312,28 @@ int main(int argc, char **argv) {
         }
 
         // Dump the FULL last-position logits.
+        //
+        // Two hazards make holding the returned pointer unsafe:
+        //   (1) llama_decode copies the logits to the host buffer
+        //       ASYNCHRONOUSLY (cudaMemcpyAsync on the context stream) and
+        //       returns before the copy lands — synchronize before reading.
+        //   (2) the host buffer is REUSED by every subsequent decode, so the
+        //       rows must be copied out NOW, before the greedy loop below.
         const int32_t last_pos = (int32_t)ids.size() - 1;
+        llama_synchronize(ctx);
         const float *logits = llama_get_logits_ith(ctx, last_pos);
         if (!logits) {
             std::fprintf(stderr, "failed to get logits for prompt %zu\n", p);
             return 1;
         }
+        std::vector<float> prefill_logits(logits, logits + n_vocab);
 
         // Greedy decode for N steps.
         std::vector<llama_token> greedy_ids;
         greedy_ids.reserve(args.decode_steps);
         for (int step = 0; step < args.decode_steps; ++step) {
-            // Sample from the current logits (last output position).
+            // Sample from the current logits (last output position). The
+            // preceding decode's async logits copy is complete (synced).
             llama_token next = llama_sampler_sample(smpl, ctx, -1);
             greedy_ids.push_back(next);
             llama_sampler_reset(smpl);
@@ -336,6 +347,10 @@ int main(int argc, char **argv) {
                 return 1;
             }
             llama_batch_free(dbatch);
+            // Ensure the async logits copy has landed before the next
+            // sample reads the host buffer (decode returns before the
+            // cudaMemcpyAsync completes).
+            llama_synchronize(ctx);
         }
 
         // Write the prompt's JSON entry.
@@ -354,12 +369,13 @@ int main(int argc, char **argv) {
         }
         out << "],\n";
 
-        // logits (full vocab, full precision)
+        // logits (full vocab, full precision) — the prefill rows copied out
+        // before the greedy loop (the context buffer is reused by then).
         out << "      \"logits\": [";
         out.precision(17);
         for (int32_t i = 0; i < n_vocab; ++i) {
             if (i) out << ", ";
-            out << logits[i];
+            out << prefill_logits[i];
         }
         out << "],\n";
 

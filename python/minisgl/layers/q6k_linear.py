@@ -86,7 +86,10 @@ class Q6KLMHead(BaseOP):
             del indices
 
         n = x.shape[0]
-        y = torch.empty(n, self.num_embeddings, device=x.device, dtype=x.dtype)
+        # f32 logits (scaffold convention; the graph runner's static buffer is
+        # f32, and the bf16 tolerance row in the verification contract assumes
+        # f32 logit output — bf16-stored logits round at ~0.125 for |logit|~40).
+        y = torch.empty(n, self.num_embeddings, device=x.device, dtype=torch.float32)
         if n == 1:
             q6k.q6k_gemv(
                 x.view(self.embedding_dim), self.weight, y.view(self.num_embeddings)

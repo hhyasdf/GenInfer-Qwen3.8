@@ -192,12 +192,75 @@ def log_stack_versions(logger) -> None:
     logger.info("stack: cuda=%s driver=%s %s", cuda, driver, " ".join(parts))
 
 
+def _port_listener_pid(port: int):
+    """Best-effort pid of the process listening on a TCP port, via /proc/net/tcp."""
+    import glob
+
+    inodes = set()
+    hexport = f"{port:04X}"
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as fh:
+                next(fh, None)  # header
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 10 and parts[1].endswith(f":{hexport}") and parts[3] == "0A":
+                        inodes.add(parts[9])
+        except OSError:
+            continue
+    if not inodes:
+        return None
+    wanted = {f"socket:[{i}]" for i in inodes}
+    for fd in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            if os.readlink(fd) in wanted:
+                return int(fd.split("/")[2])
+        except OSError:
+            continue
+    return None
+
+
+def agent_port_guard(server_port: int, logger) -> None:
+    """Exit fast when our port is already being served.
+
+    This engine is about to load a model on the GPU and bind `server_port`;
+    doing that beside a service that already serves steals VRAM and stalls
+    that service even when the model fits. The agent port is taken only by
+    the supervisor's engine-verify transaction; interactive debugging runs
+    under a gpu-hold (the incumbent evacuated, the engine on the spare port);
+    a one-shot GPU command is a gpu-job. None of those binds a port another
+    service owns, so a busy port here is always a launch that should not
+    happen. Exit 2, before any model load or worker start.
+    """
+    import socket
+
+    probe = socket.socket()
+    probe.settimeout(1)
+    busy = probe.connect_ex(("127.0.0.1", server_port)) == 0
+    probe.close()
+    if not busy:
+        return
+    owner = _port_listener_pid(server_port)
+    logger.critical(
+        "port %d is already being served%s — starting now would load a model "
+        "beside that service and stall it. The agent port is taken only by "
+        "the supervisor's engine-verify transaction; for interactive debugging "
+        "write {\"kind\": \"gpu-hold\"} to .supervisor-action and start on the "
+        "spare port (--port <agent port + 1>); a one-shot GPU command is a "
+        "gpu-job. Or serve a port nothing else serves (--port).",
+        server_port,
+        f" (owner pid {owner})" if owner else "",
+    )
+    sys.exit(2)
+
+
 def launch_server(run_shell: bool = False) -> None:
     from .api_server import run_api_server
     from .args import parse_args
 
     server_args, run_shell = parse_args(sys.argv[1:], run_shell)
     logger = init_logger(__name__, "initializer")
+    agent_port_guard(server_args.server_port, logger)
     log_stack_versions(logger)
 
     run_api_server(server_args, lambda: start_subprocess(server_args, logger), run_shell=run_shell)

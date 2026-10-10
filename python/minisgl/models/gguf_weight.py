@@ -1,22 +1,25 @@
 """GGUF weight loader.
 
 Maps GGUF tensor names to the model's state_dict keys and loads the raw
-quantized bytes (Q6_K, Q8_0) or floating-point values (F32) into torch
+quantized bytes (Q6_K, Q8_0) or floating-point values (F32, BF16) into torch
 tensors on the target device.
 
 The Q6_K / Q8_0 tensors are kept as raw uint8 bytes (the K-quants GEMM/GEMV
 kernels dequantize in registers). F32 tensors are loaded as float32 and the
-engine casts them to the model dtype (bf16).
+engine casts them to the model dtype (bf16). BF16 tensors (e.g. the GDN
+ssm_alpha / ssm_beta) are loaded as bfloat16 directly.
 
 GGUF tensor layout (row-major, innermost dimension quantized in blocks):
   Q6_K: 256 elements per block, 210 bytes per block.
   Q8_0:  32 elements per block,  34 bytes per block (2-byte half scale + 32 int8).
   F32:   1 element per "block",   4 bytes per element.
+  BF16:  1 element per "block",   2 bytes per element.
 
 For a 2-D tensor [N, K]:
   Q6_K: total bytes = N * (K/256) * 210, reshaped to [N, K//256*210] uint8.
   Q8_0: total bytes = N * (K/32)  *  34, reshaped to [N, K//32*34]  uint8.
   F32:  total bytes = N * K * 4,   reshaped to [N, K] float32 (any ndim).
+  BF16: total bytes = N * K * 2,   reshaped to [N, K] bfloat16 (any ndim).
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ from typing import Iterator, List, Tuple
 
 import torch
 
-from .gguf_reader import GgufReader, GGML_F32, GGML_Q8_0, GGML_Q6_K
+from .gguf_reader import GgufReader, GGML_F32, GGML_BF16, GGML_Q8_0, GGML_Q6_K
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +79,40 @@ _LAYER_NAME_MAP = {
 # Regex to extract the layer index from a "blk.N.<suffix>" name.
 _BLK_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
 
+# MTP (multi-token-prediction) block — the extra decoder block (blk.64) that
+# drafts the next token from (sampled token, hidden state). Its full-attn
+# tensors share suffixes with the main full-attn layers, but its state_dict
+# keys live under the ``mtp.*`` namespace (a separate module, not part of
+# ``model.layers``). The ``nextn.*`` tensors are the MTP head's projections.
+# The MTP block index is the first block after the 64 main layers (blk.0..63).
+_MTP_BLOCK_ID = 64
+_MTP_LAYER_NAME_MAP = {
+    # The MTPBlock declares its submodules flat (mtp.attn_q, mtp.ffn_gate,
+    # ...), so the state_dict keys carry no attn./mlp. prefix.
+    # full-attn projections (Q8_0)
+    "attn_q.weight": "attn_q.weight",
+    "attn_k.weight": "attn_k.weight",
+    "attn_v.weight": "attn_v.weight",
+    "attn_output.weight": "attn_output.weight",
+    # per-head norms (F32)
+    "attn_q_norm.weight": "attn_q_norm.weight",
+    "attn_k_norm.weight": "attn_k_norm.weight",
+    # MLP (Q8_0)
+    "ffn_gate.weight": "ffn_gate.weight",
+    "ffn_up.weight": "ffn_up.weight",
+    "ffn_down.weight": "ffn_down.weight",
+    # layer norms (F32)
+    "attn_norm.weight": "input_layernorm.weight",
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    # MTP head (nextn): the model declares these directly under MTPBlock
+    # (mtp.eh_proj, mtp.enorm, ...), so the state_dict keys carry no nextn.
+    # prefix.
+    "nextn.eh_proj.weight": "eh_proj.weight",
+    "nextn.enorm.weight": "enorm.weight",
+    "nextn.hnorm.weight": "hnorm.weight",
+    "nextn.shared_head_norm.weight": "shared_head_norm.weight",
+}
+
 
 def _map_gguf_name(gguf_name: str) -> str:
     """Map a GGUF tensor name to the model's state_dict key.
@@ -91,6 +128,10 @@ def _map_gguf_name(gguf_name: str) -> str:
     if m:
         layer_id = int(m.group(1))
         suffix = m.group(2)
+        if layer_id == _MTP_BLOCK_ID:
+            if suffix in _MTP_LAYER_NAME_MAP:
+                return f"mtp.{_MTP_LAYER_NAME_MAP[suffix]}"
+            raise KeyError(f"Unmapped MTP tensor name: {gguf_name}")
         if suffix in _LAYER_NAME_MAP:
             return f"model.layers.{layer_id}.{_LAYER_NAME_MAP[suffix]}"
 
@@ -138,6 +179,10 @@ def _reshape_tensor(
         t = t.view(torch.float32)
         return t.view(shape)
 
+    if tensor_type == GGML_BF16:
+        t = t.view(torch.bfloat16)
+        return t.view(shape)
+
     # Quantized types: reshape to [N, K//block_elems * block_bytes] (2-D)
     # or [K//block_elems * block_bytes] (1-D).
     block_elems = _quant_block_elems(tensor_type)
@@ -163,13 +208,14 @@ def _reshape_tensor(
 def find_main_gguf(model_dir: str) -> str:
     """Find the main GGUF shard in a model directory.
 
-    Excludes dflash (draft) and mmproj (vision) shards by basename.
+    Excludes mmproj (vision) shards by basename. The MTP draft block is
+    embedded in the main GGUF as blk.64 (no separate draft file).
     """
     gguf_files = [f for f in os.listdir(model_dir) if f.endswith(".gguf")]
     if not gguf_files:
         raise FileNotFoundError(f"No .gguf files in {model_dir}")
     for f in sorted(gguf_files):
-        if "dflash" not in f.lower() and "mmproj" not in f.lower():
+        if "mmproj" not in f.lower():
             return os.path.join(model_dir, f)
     return os.path.join(model_dir, gguf_files[0])
 
@@ -186,7 +232,7 @@ def load_gguf_weight(
     Yields:
         (name, tensor) pairs where name is the model's state_dict key and
         tensor is on the target device. Q6_K/Q8_0 tensors are uint8 (raw
-        quantized bytes); F32 tensors are float32.
+        quantized bytes); F32 tensors are float32; BF16 tensors are bfloat16.
     """
     main_shard = find_main_gguf(model_path)
     logger.info("Loading GGUF weights from %s", main_shard)

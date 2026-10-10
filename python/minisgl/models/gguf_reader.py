@@ -23,9 +23,9 @@ The GGUF tensor types (from ggml.h):
   11 Q3_K
   12 Q4_K
   13 Q5_K
-  14 Q6_K
+    14 Q6_K
   15 Q8_K
-  22 BF16
+  30 BF16   (slot 30 in the 2026 llama.cpp fork; the old slot 22 is now IQ2_S)
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ GGML_Q8_0 = 8
 GGML_Q4_K = 12
 GGML_Q5_K = 13
 GGML_Q6_K = 14
-GGML_BF16 = 22
+GGML_BF16 = 30  # slot 30 in the 2026 llama.cpp fork (moved from 22)
 
 
 @dataclass
@@ -93,7 +93,16 @@ class GgufReader:
         self._parse_header()
         self._parse_metadata()
         self._parse_tensor_infos()
-        self._tensor_data_start = self._pos
+        # The tensor-data section starts at the first ``general.alignment``
+        # boundary after the header (the GGUF spec default is 32). The header
+        # end is NOT aligned, so we must round up — otherwise every tensor's
+        # data is read a few bytes too early and the weights come out as
+        # garbage (the F32 tensors make this most visible: an off-alignment
+        # shift turns them into a plausible/garbage/zero mix).
+        align = self.metadata.get("general.alignment")
+        if not isinstance(align, int) or align <= 0:
+            align = 32
+        self._tensor_data_start = (self._pos + align - 1) // align * align
 
     def close(self) -> None:
         self._buf.close()

@@ -33,9 +33,11 @@ short greedy (`references/backends/cpu.md`).
   64 layers = 48 GDN + 16 full-attn, hidden 5120, ctx 262144 (engine max
   100k), vocab 248320, with the embedded MTP draft block (blk.64). Weights Q6_K (main, incl. the MTP block) + Q8_0 (mmproj
   Qwen3-VL ViT). GGUF-only checkpoint (no HF safetensors, no tokenizer.json).
-- **Hardware**: 2× PCIe GPU (no NVLink): 4070 Ti Super 16 GB (sm_89) +
-  2080 Ti 22 GB (sm_75, 700 MB display reserve). 37.31 GiB usable. 29 GB
-  RAM. Toolkit: CUDA 13.0, driver 616.92.
+- **Hardware**: 2× PCIe GPU (no NVLink): 4070 Ti Super 16 GB (sm_89, full-total
+  budget 16 GiB) + 2080 Ti 22 GB (sm_75, **Display GPU** — user declaration, B0;
+  the B1 probe was inconclusive on this headless box, so the declaration stands;
+  engine budget there = total − 1G = 21 GiB). 37 GiB usable. 29 GB RAM.
+  Toolkit: CUDA 13.0, driver 616.92.
 - **Use case**: OpenAI-compatible streaming HTTP API, single user,
   latency-first. The agent port (8080) already serves the origin
   llama-server.
@@ -82,8 +84,10 @@ llama-server baseline on this suite to bind the agent port.
   22.17 GiB (main Q6_K 21.58, incl. the embedded MTP block, + mmproj Q8_0 0.59, split
   across 2 GPUs), KV 3.64 GiB @ 100k (main q8_0 3.43 + MTP 1 full-attn layer q8_0 0.21),
   activation workspace 2 GiB, pinned host 0.2 GiB, graph pool 1 GiB, GDN
-  state 0.023 GiB (fixed). Total 29.03 GiB < 37.31 GiB usable. Never
-  reallocated in the serving loop.
+  state 0.023 GiB (fixed). Total 29.03 GiB < 37 GiB usable (38 total − 1G
+  display reserve on the 2080 Ti, the Display GPU). Per-card: 2080 Ti
+  ≈ 18.7 GiB < 21 GiB (total − 1G); 4070 Ti Super ≈ 11.7 GiB + activations
+  < 16 GiB (full total). Never reallocated in the serving loop.
 - **Batching**: single-stream (concurrency 1, no continuous batching) +
   chunked prefill (ubatch 1024) for the 60k inputs.
 - **Backend**: CUDA (mini-sglang). The oracle is the baked golden file

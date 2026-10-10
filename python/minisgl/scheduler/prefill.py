@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
-from minisgl.core import Batch, Req
+from minisgl.core import Batch, Context, Req
 from minisgl.utils import init_logger
 
 from .utils import PendingReq
@@ -35,6 +35,11 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    # GDN (linear-attention) models keep a single global recurrent state that
+    # must be zeroed at the start of every new request. Set when a NEW request
+    # is added (first prefill chunk) — not on continuation chunks, where the
+    # delta-rule recurrence must continue across chunks.
+    ctx: Context | None = None
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
@@ -103,6 +108,11 @@ class PrefillAdder:
 
         if resource := self._try_allocate_one(pending_req):
             cache_handle, table_idx = resource
+            # New request (first prefill chunk): zero the GDN recurrent state
+            # before its prefill forward. Continuation chunks (above) must NOT
+            # reset — the recurrence carries across chunks of one request.
+            if self.ctx is not None:
+                self.ctx.request_gdn_reset()
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -119,6 +129,7 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    ctx: Context | None = None
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
@@ -133,6 +144,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            ctx=self.ctx,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

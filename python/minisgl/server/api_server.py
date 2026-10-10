@@ -94,10 +94,17 @@ class GenerateRequest(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
+    # "tool" is required: OpenAI tool-result messages (and the agent's own
+    # tool-calling traffic) carry it; the GGUF jinja template renders a
+    # tool_response block for it.
+    role: Literal["system", "user", "assistant", "tool"]
     # Full OpenAI content shape: a string, null (an assistant turn with
     # tool_calls), missing, or a content-parts array.
     content: str | None | List[dict] = None
+    # OpenAI tool-calling fields, passed through to the chat template as-is.
+    tool_calls: List[dict] | None = None
+    tool_call_id: str | None = None
+    reasoning_content: str | None = None
 
     def text_content(self) -> str:
         """The text the engine serves: strings as-is, null/missing as "",
@@ -117,6 +124,42 @@ class Message(BaseModel):
             else:
                 logger.warning("Dropping non-text content part: %r", part)
         return "".join(parts)
+
+
+def _tool_call_to_dict(tc: dict) -> dict:
+    """tool_call dict -> template-ready dict.
+
+    The GGUF jinja template iterates tool_call.arguments with |items, which
+    requires a mapping, but OpenAI clients send arguments as a JSON string.
+    Parse it here; a mapping (some clients) passes through unchanged."""
+    tc = dict(tc)
+    fn = tc.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+        fn = dict(fn)
+        try:
+            fn["arguments"] = json.loads(fn["arguments"])
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("tool_call arguments is not a JSON object; passing through: %r", fn["arguments"])
+        tc["function"] = fn
+    return tc
+
+
+def _message_to_dict(m: Message) -> dict:
+    """Message -> plain dict for apply_chat_template in the tokenizer worker.
+
+    role/content go through text_content(); OpenAI tool-calling fields
+    (tool_calls on an assistant turn, tool_call_id on a tool result,
+    reasoning_content on a thinking turn) are normalized for the template:
+    tool_calls[].function.arguments is parsed from its JSON-string form into
+    a mapping, which the GGUF jinja template requires for |items."""
+    d = {"role": m.role, "content": m.text_content()}
+    if m.tool_calls is not None:
+        d["tool_calls"] = [_tool_call_to_dict(tc) for tc in m.tool_calls]
+    if m.tool_call_id is not None:
+        d["tool_call_id"] = m.tool_call_id
+    if m.reasoning_content is not None:
+        d["reasoning_content"] = m.reasoning_content
+    return d
 
 
 class OpenAICompletionRequest(BaseModel):
@@ -328,7 +371,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     if req.messages:
         # Normalize to plain dicts before apply_chat_template in the
         # tokenizer worker (content parts reduced to text).
-        prompt = [{"role": m.role, "content": m.text_content()} for m in req.messages]
+        prompt = [_message_to_dict(m) for m in req.messages]
     elif req.prompt is not None:
         prompt = _first_prompt(req.prompt)
     else:
@@ -406,7 +449,7 @@ async def available_models():
 async def shell_completion(req: OpenAICompletionRequest):
     state = get_global_state()
     assert req.messages is not None, "Shell completion only supports chat-completions"
-    prompt = [{"role": m.role, "content": m.text_content()} for m in req.messages]
+    prompt = [_message_to_dict(m) for m in req.messages]
 
     # TODO: support more sampling parameters
     uid = state.new_user()

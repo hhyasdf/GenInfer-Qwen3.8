@@ -30,7 +30,8 @@ field is a user-supplied value (B0 intake) or a checkpoint-verified fact
 
 ## Hardware
 - device: 2x NVIDIA — **RTX 4070 Ti Super (16 GB, sm_89)** + **RTX 2080 Ti (22 GB, sm_75 Turing)**
-- vram: 38 GB total; reserve 700 MB on the 2080 Ti for the display → **37.31 GiB usable**
+- vram: 38 GB total; the display card (2080 Ti) is budgeted at total − 1G (the driver and display framebuffer reserve there) → **37 GiB usable**
+- display_gpu: **CUDA1 (2080 Ti)** — the card that outputs the screen image. User declaration (B0). The B1 probe (`scripts/probe_display_gpu.py`) was inconclusive (exit 2 — headless machine: no X screen, no `Display Active`, no connected DRM connector), so the user declaration stands and is recorded here as a user declaration. Engine budget on that card = 22528 − 1024 = **21 GiB**; the 4070 Ti Super's budget is its full total (**16 GiB**)
 - ram: 29 GB (Intel i5-13600KF, 20 threads)
 - toolkit: CUDA nvcc 13.0 (driver 616.92)
 - gpus: 2, **PCIe (no NVLink)** → non-uniform layer split (more on the 2080 Ti), not high-bandwidth tensor parallel
@@ -55,7 +56,8 @@ field is a user-supplied value (B0 intake) or a checkpoint-verified fact
 
 ## Capacity   (B1)
 Estimates. The engine startup line `allocation table:` is the measurement of the same five regions.
-All figures in GiB. Usable VRAM = 37.31 GiB.
+All figures in GiB. Usable VRAM = 37 GiB (38 total − 1G display reserve on the display card, CUDA1).
+Per-card budgets: CUDA0 (4070 Ti Super) 16 GiB (full total); CUDA1 (2080 Ti, display) 21 GiB (total − 1G).
 
 - weights: main Q6_K **21.58** (includes the MTP block blk.64) + mmproj Q8_0 0.59 = **22.17 GiB**
 - kv (engine max context = **100k**, the scenario's floor; only the **16 full-attn** main layers + the **1 MTP** full-attn layer grow):
@@ -68,7 +70,7 @@ All figures in GiB. Usable VRAM = 37.31 GiB.
 - graph_pool (CUDA graph capture pool): **1 GiB**
 - GDN recurrent state (48 layers, **fixed**, does not grow with length): **0.023 GiB**
 - **fits: YES @ Q6_K, engine max context = 100k.**
-  - 100k total = 22.17 (weights) + 3.64 (kv) + 2 (activation) + 0.2 (pinned) + 1 (graph) + 0.023 (GDN) = **29.03 GiB < 37.31 GiB usable** (headroom ~8.3 GiB).
-  - Non-uniform split (B2): 4070 Ti Super ~12 GiB, 2080 Ti ~20 GiB (both fit; the MTP block + mmproj land on the 2080 Ti, matching the origin's `--spec-draft-device CUDA1` and `MTMD_BACKEND_DEVICE=CUDA1`).
+  - 100k total = 22.17 (weights) + 3.64 (kv) + 2 (activation) + 0.2 (pinned) + 1 (graph) + 0.023 (GDN) = **29.03 GiB < 37 GiB usable** (headroom ~8.0 GiB).
+  - Non-uniform split (B2): 4070 Ti Super ~12 GiB (< its 16 GiB full-total budget), 2080 Ti ~20 GiB (< its 21 GiB = total − 1G display budget); the MTP block + mmproj land on the 2080 Ti, matching the origin's `--spec-draft-device CUDA1` and `MTMD_BACKEND_DEVICE=CUDA1`.
   - **Floor:** 100k is the engine max context. Never below 100k. (256k now fits, but the floor is unchanged.)
 - target: **decode >= 20 tok/s sustained (concurrency 1), maximize beyond; TTFT(60k) < 30 s**

@@ -97,7 +97,8 @@ struct Q6KGemvParams {
 };
 
 template <std::size_t K, std::size_t N, std::size_t kNumThreads = 128,
-          std::size_t kMaxOccupancy = 1, bool kUsePDL = false>
+          std::size_t kMaxOccupancy = 1, bool kUsePDL = false,
+          bool kF32Out = false>
 __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void
 q6k_gemv_kernel(const __grid_constant__ Q6KGemvParams params) {
   using namespace device;
@@ -135,7 +136,11 @@ q6k_gemv_kernel(const __grid_constant__ Q6KGemvParams params) {
     acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
   }
   if (lane_id == 0) {
-    params.y[warp_id] = __float2bfloat16(acc);
+    if constexpr (kF32Out) {
+      reinterpret_cast<float *>(params.y)[warp_id] = acc;
+    } else {
+      params.y[warp_id] = __float2bfloat16(acc);
+    }
   }
   PDL::launch<kUsePDL>();
 }
@@ -162,7 +167,8 @@ struct Q6KGemmParams {
 };
 
 template <std::size_t K, std::size_t N, std::size_t kNumThreads = 256,
-          std::size_t kMaxOccupancy = 1, bool kUsePDL = false>
+          std::size_t kMaxOccupancy = 1, bool kUsePDL = false,
+          bool kF32Out = false>
 __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void
 q6k_gemm_kernel(const __grid_constant__ Q6KGemmParams params) {
   using namespace device;
@@ -260,8 +266,13 @@ q6k_gemm_kernel(const __grid_constant__ Q6KGemmParams params) {
     for (int dn = 0; dn < 4; dn++) {
       const int ng = n0 + tx * 4 + dn;
       if (ng < static_cast<int>(N)) {
-        params.Y[static_cast<size_t>(mg) * N + ng] =
-            __float2bfloat16(acc[dm][dn]);
+        if constexpr (kF32Out) {
+          reinterpret_cast<float *>(params.Y)[static_cast<size_t>(mg) * N + ng] =
+              acc[dm][dn];
+        } else {
+          params.Y[static_cast<size_t>(mg) * N + ng] =
+              __float2bfloat16(acc[dm][dn]);
+        }
       }
     }
   }
@@ -324,7 +335,8 @@ q6k_gather_kernel(const __grid_constant__ Q6KGatherParams params) {
 // ---------------------------------------------------------------------------
 
 template <std::size_t K, std::size_t N, std::size_t kNumThreads = 128,
-          std::size_t kMaxOccupancy = 1, bool kUsePDL = false>
+          std::size_t kMaxOccupancy = 1, bool kUsePDL = false,
+          bool kF32Out = false>
 struct Q6KGemvKernel {
   static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView W,
                   const tvm::ffi::TensorView y) {
@@ -342,10 +354,17 @@ struct Q6KGemvKernel {
         .with_dtype<uint8_t>()
         .with_device<kDLCUDA>(device_)
         .verify(W);
-    TensorMatcher({static_cast<int64_t>(N)})
-        .with_dtype(bf16)
-        .with_device<kDLCUDA>(device_)
-        .verify(y);
+    if constexpr (kF32Out) {
+      TensorMatcher({static_cast<int64_t>(N)})
+          .with_dtype<float>()
+          .with_device<kDLCUDA>(device_)
+          .verify(y);
+    } else {
+      TensorMatcher({static_cast<int64_t>(N)})
+          .with_dtype(bf16)
+          .with_device<kDLCUDA>(device_)
+          .verify(y);
+    }
 
     const auto device = device_.unwrap();
     constexpr int kWarpPerBlock = static_cast<int>(kNumThreads) / 32;
@@ -357,12 +376,14 @@ struct Q6KGemvKernel {
     };
     LaunchKernel(num_blocks, kNumThreads, device)
         .with_attr(kUsePDL)(
-            q6k_gemv_kernel<K, N, kNumThreads, kMaxOccupancy, kUsePDL>, params);
+            q6k_gemv_kernel<K, N, kNumThreads, kMaxOccupancy, kUsePDL, kF32Out>,
+            params);
   }
 };
 
 template <std::size_t K, std::size_t N, std::size_t kNumThreads = 256,
-          std::size_t kMaxOccupancy = 1, bool kUsePDL = false>
+          std::size_t kMaxOccupancy = 1, bool kUsePDL = false,
+          bool kF32Out = false>
 struct Q6KGemmKernel {
   static void run(const tvm::ffi::TensorView X, const tvm::ffi::TensorView W,
                   const tvm::ffi::TensorView Y) {
@@ -381,10 +402,17 @@ struct Q6KGemmKernel {
         .with_dtype<uint8_t>()
         .with_device<kDLCUDA>(device_)
         .verify(W);
-    TensorMatcher({M, static_cast<int64_t>(N)})
-        .with_dtype(bf16)
-        .with_device<kDLCUDA>(device_)
-        .verify(Y);
+    if constexpr (kF32Out) {
+      TensorMatcher({M, static_cast<int64_t>(N)})
+          .with_dtype<float>()
+          .with_device<kDLCUDA>(device_)
+          .verify(Y);
+    } else {
+      TensorMatcher({M, static_cast<int64_t>(N)})
+          .with_dtype(bf16)
+          .with_device<kDLCUDA>(device_)
+          .verify(Y);
+    }
 
     const auto device = device_.unwrap();
     const int m = static_cast<int>(M.unwrap());
@@ -397,7 +425,8 @@ struct Q6KGemmKernel {
     };
     LaunchKernel(grid, kNumThreads, device)
         .with_attr(kUsePDL)(
-            q6k_gemm_kernel<K, N, kNumThreads, kMaxOccupancy, kUsePDL>, params);
+            q6k_gemm_kernel<K, N, kNumThreads, kMaxOccupancy, kUsePDL, kF32Out>,
+            params);
   }
 };
 

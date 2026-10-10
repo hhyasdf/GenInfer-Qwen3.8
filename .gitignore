@@ -39,6 +39,8 @@ env/
 
 # supervisor state (written by the skill's supervisor; a stale one means the supervisor died)
 .engine.pid
+.supervisor.pid
+.supervisor-txn
 .restart-requested
 .backend
 .force-takeover
@@ -53,3 +55,6 @@ logs/
 .mypy_cache/
 .ruff_cache/
 .htmlcov/
+
+# code index (built by a codegraph-like retrieval tool; see AGENTS.md "Code search")
+.codegraph/

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import time
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Optional, Tuple
 
@@ -58,6 +60,16 @@ class ForwardOutput(NamedTuple):
 
 class Engine:
     def __init__(self, config: EngineConfig):
+        # Expandable segments: on a GPU that is nearly full (e.g. a 21 GiB
+        # model on a 22 GiB card), the caching allocator's fixed segments
+        # fragment the free memory into small blocks after weight loading,
+        # so a later large allocation (the 128 MiB attention workspace)
+        # cannot find a contiguous run and OOMs even though ~180 MiB is
+        # reserved-but-unallocated. Expandable segments grow a single
+        # virtual region instead, keeping the free memory usable.
+        # Must be set before the allocator's first init — the assert below
+        # proves no CUDA op (hence no allocation) has run yet.
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         if config.uses_layer_split:
@@ -72,8 +84,8 @@ class Engine:
             )
         _adjust_config(config)
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
-        torch.cuda.set_device(self.device)
+        self.device = torch.device(config.device or f"cuda:{config.tp_info.rank}")
+        self._wait_device_ready(self.device)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -99,11 +111,15 @@ class Engine:
         self.model.world_size = config.tp_info.size
         self.model.dtype = self.dtype
         self.model.load_state_dict(self._load_weight_state_dict(config))
-        # Initialize the per-request GDN recurrent state (qwen35). It is reset
-        # at sequence start; for a single-request engine the startup reset is
-        # the one that matters for the boot gate.
+        # Initialize the per-request GDN recurrent state (qwen35). The state
+        # is a single global per-layer tensor updated in place by the GDN
+        # kernel, so it carries the previous request's final recurrence into
+        # the next request unless zeroed at the request boundary. The startup
+        # reset covers the boot gate; the ctx hook covers every later request
+        # (consumed by the next prefill forward — see Context.forward_batch).
         if hasattr(self.model, "reset_gdn_state"):
             self.model.reset_gdn_state(self.device, self.dtype)
+            self.ctx.gdn_reset_fn = lambda: self.model.reset_gdn_state(self.device, self.dtype)
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -128,6 +144,11 @@ class Engine:
         )
 
         # ======================= Attention & MoE backend initialization ========================
+        # Release reserved-but-unallocated memory from weight loading before the
+        # attention backend allocates its workspace buffer. On a GPU that is
+        # nearly full (e.g. a 21 GiB model on a 22 GiB card), the caching
+        # allocator's retained segments can starve the next allocation.
+        torch.cuda.empty_cache()
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
@@ -179,6 +200,50 @@ class Engine:
             mem_GB(self.graph_runner.graph_pool_bytes),
             mem_GB(self.page_table_bytes),
         )
+
+    def _wait_device_ready(self, device: torch.device, timeout: float = 180.0) -> None:
+        """Block until the CUDA device accepts work, retrying driver teardown.
+
+        After the supervisor kills the incumbent origin, the driver mid-reset
+        accepts context creation (torch.cuda.mem_get_info works) but a real
+        H2D transfer or kernel launch raises 'device not ready' for ~30-60 s
+        while it finishes tearing down the dead context. Probe with a small
+        allocation + copy + kernel + synchronize and back off until it lands.
+        """
+        deadline = time.monotonic() + timeout
+        start = deadline - timeout
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                torch.cuda.set_device(device)
+                src = torch.empty(1024, dtype=torch.int32, pin_memory=True)
+                dst = src.to(device)
+                dst.add_(1)
+                torch.cuda.synchronize(device)
+                del dst, src
+                if attempt > 1:
+                    logger.info_rank0(
+                        "device %s ready after %d retries (%.1f s)",
+                        device,
+                        attempt - 1,
+                        time.monotonic() - start,
+                    )
+                return
+            except Exception as e:  # noqa: BLE001 — the driver raises many forms
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"CUDA device {device} not ready after {timeout:.0f}s of retries"
+                    ) from e
+                wait = min(5.0, 0.5 * attempt)
+                logger.info(
+                    "device %s not ready yet (%s); retrying in %.1f s (attempt %d)",
+                    device,
+                    str(e).splitlines()[0][:120],
+                    wait,
+                    attempt,
+                )
+                time.sleep(wait)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -333,7 +398,10 @@ class Engine:
                 # norm + the lm_head, sample, and send the next tokens to the
                 # predecessor rank.
                 logits = self.model.forward()
-                next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+                # The lm_head already yields one row per request (get_last_indices
+                # reduces the prefill extend block to its last row), so the
+                # sampler consumes the full tensor as-is — no per-token gather.
+                next_tokens_gpu = self.sampler.sample(logits, args).to(torch.int32)
                 self.model.send_tokens(next_tokens_gpu)
             elif self.config.uses_layer_split:
                 # Middle rank: receive the handoff from the predecessor, run
@@ -349,7 +417,10 @@ class Engine:
                     logits = self.graph_runner.replay(batch)
                 else:
                     logits = self.model.forward()
-                next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+                # The lm_head already yields one row per request (get_last_indices
+                # reduces the prefill extend block to its last row), so the
+                # sampler consumes the full tensor as-is — no per-token gather.
+                next_tokens_gpu = self.sampler.sample(logits, args).to(torch.int32)
 
         for req in batch.reqs:
             req.complete_one()

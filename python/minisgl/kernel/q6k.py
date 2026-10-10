@@ -19,9 +19,9 @@ def _bytes_per_block(K: int) -> int:
 
 
 @functools.cache
-def _gemv_module(K: int, N: int):
+def _gemv_module(K: int, N: int, f32_out: bool):
     config = KernelConfig(num_threads=128, max_occupancy=1, use_pdl=False)
-    args = make_cpp_args(K, N, *config)
+    args = make_cpp_args(K, N, *config, f32_out)
     return load_jit(
         "q6k_gemv",
         *args,
@@ -31,9 +31,9 @@ def _gemv_module(K: int, N: int):
 
 
 @functools.cache
-def _gemm_module(K: int, N: int):
+def _gemm_module(K: int, N: int, f32_out: bool):
     config = KernelConfig(num_threads=256, max_occupancy=1, use_pdl=False)
-    args = make_cpp_args(K, N, *config)
+    args = make_cpp_args(K, N, *config, f32_out)
     return load_jit(
         "q6k_gemm",
         *args,
@@ -57,23 +57,29 @@ def _gather_module(K: int):
 def q6k_gemv(
     x: torch.Tensor,  # [K] bf16
     W: torch.Tensor,  # [N, K // 256 * 210] uint8 (Q6_K)
-    y: torch.Tensor,  # [N] bf16
+    y: torch.Tensor,  # [N] bf16 or f32
 ) -> None:
-    """Q6_K GEMV: y[n] = sum_k W[n, k] * x[k]. One warp per output row."""
+    """Q6_K GEMV: y[n] = sum_k W[n, k] * x[k]. One warp per output row.
+
+    Output dtype is taken from ``y``: bf16 for activations, f32 for logits.
+    """
     K = x.shape[0]
     N = y.shape[0]
-    _gemv_module(K, N).run(x, W, y)
+    _gemv_module(K, N, y.dtype == torch.float32).run(x, W, y)
 
 
 def q6k_gemm(
     X: torch.Tensor,  # [M, K] bf16
     W: torch.Tensor,  # [N, K // 256 * 210] uint8 (Q6_K)
-    Y: torch.Tensor,  # [M, N] bf16
+    Y: torch.Tensor,  # [M, N] bf16 or f32
 ) -> None:
-    """Q6_K GEMM: Y[m, n] = sum_k X[m, k] * W[n, k]. 128x128 tiles, N-fast grid."""
+    """Q6_K GEMM: Y[m, n] = sum_k X[m, k] * W[n, k]. 128x128 tiles, N-fast grid.
+
+    Output dtype is taken from ``Y``: bf16 for activations, f32 for logits.
+    """
     M, K = X.shape
     N = Y.shape[1]
-    _gemm_module(K, N).run(X, W, Y)
+    _gemm_module(K, N, Y.dtype == torch.float32).run(X, W, Y)
 
 
 def q6k_gather(

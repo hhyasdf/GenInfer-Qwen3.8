@@ -4,8 +4,11 @@ The CUDA kernel processes the delta-rule recurrence sequentially over tokens,
 but in parallel across heads and state columns. Each warp owns one column of
 the per-head state matrix S [S_v, S_v].
 
-State layout: [Hv, S_v, S_v] float32 (row-major per head).
-  S[h, i, col] is at offset h * S_v * S_v + i * S_v + col.
+State layout: M [Hv, S_v, S_v] float32, where M[h, col, i] = S[h, i, col].
+The state is stored transposed so that each warp can load a contiguous row
+(the physical row is the value index ``col``, the physical column the key
+index ``i``). The caller treats ``state`` as an opaque tensor; the kernel
+updates it in place.
 
 q/k have Hq heads (16 for qwen35); v has Hv heads (48 for qwen35).
 The kernel maps h_idx → h_idx % Hq for q/k access.

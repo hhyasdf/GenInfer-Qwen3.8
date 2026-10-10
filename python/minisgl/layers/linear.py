@@ -20,13 +20,19 @@ class _LinearTPImpl(BaseOP):
         local_isize: int,
         local_osize: int,
         has_bias: bool,
+        dtype: torch.dtype = torch.float32,
     ):
         self.full_input_size = full_isize
         self.full_output_size = full_osize
         self.local_input_size = local_isize
         self.local_output_size = local_osize
-        self.weight = torch.empty(local_osize, local_isize)
-        self.bias = torch.empty(local_osize) if has_bias else None
+        # dtype: the weight storage dtype. Plain F32 GGUF tensors load as
+        # float32 (the default); GGUF BF16 tensors (e.g. the qwen35 GDN
+        # ssm_alpha / ssm_beta projections) load as bfloat16 and must stay
+        # bfloat16 here — the activation is bf16 and F.linear rejects a
+        # mixed-dtype input/weight pair.
+        self.weight = torch.empty(local_osize, local_isize, dtype=dtype)
+        self.bias = torch.empty(local_osize, dtype=dtype) if has_bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
@@ -43,6 +49,7 @@ class LinearReplicated(_LinearTPImpl):
         input_size: int,
         output_size: int,
         has_bias: bool,
+        dtype: torch.dtype = torch.float32,
     ):
         super().__init__(
             full_isize=input_size,
@@ -50,6 +57,7 @@ class LinearReplicated(_LinearTPImpl):
             local_isize=input_size,
             local_osize=output_size,
             has_bias=has_bias,
+            dtype=dtype,
         )
 
 

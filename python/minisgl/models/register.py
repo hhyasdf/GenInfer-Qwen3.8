@@ -10,12 +10,10 @@ _MODEL_REGISTRY = {
     "MistralForCausalLM": (".mistral", "MistralForCausalLM"),
     "Mistral3ForConditionalGeneration": (".mistral", "MistralForCausalLM"),
     # Qwen3.8-27B GDN hybrid (GGUF arch qwen35). The GGUF reader maps the
-    # arch to this class name.
+    # arch to this class name. The MTP draft block (blk.64) is loaded as part
+    # of this model (under the ``mtp.*`` state_dict namespace), not as a
+    # separate model.
     "Qwen35ForCausalLM": (".qwen35", "Qwen35ForCausalLM"),
-    # dflash2 speculative-decode draft.
-    "DflashForCausalLM": (".dflash", "DflashForCausalLM"),
-    # Qwen3-VL vision tower (mmproj).
-    "Qwen3VLVision": (".clip", "Qwen3VLVision"),
 }
 
 

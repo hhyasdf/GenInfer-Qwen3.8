@@ -64,6 +64,11 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        # GDN (linear-attention) models keep a single global recurrent state
+        # that must be zeroed at the start of every new request. The prefill
+        # adder calls ctx.request_gdn_reset() when it adds a NEW request
+        # (first prefill chunk); Context.forward_batch consumes the flag.
+        self.prefill_manager.ctx = self.engine.ctx
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
