@@ -160,7 +160,7 @@ silver, its surface barely disturbed by the first breath of morning. Mist drifts
 over the water, softening the banks…"* The `[detok-out]` trace shows true incremental
 deltas (`'drift'` then `'s'`, `'soft'` then `'ening'`) — no overlap.
 
-**Performance (`.spec-probe.sh`, clean — no debug env):**
+**Performance (`hacks/spec-probe.sh`, clean — no debug env):**
 - Request A (tiny prompt, 400 tokens): 30.949 s → **13.1 tok/s** sustained decode, coherent.
 - Request B (~8k prompt, 50 tokens): 119.6 s wall → **TTFT(8k) ≈ 116 s** (prefill-dominated).
 - Acceptance over 12 spec steps: 5×L=4, 4×L=0, 3×L=1 → **avg L ≈ 1.9**; 33% of steps
