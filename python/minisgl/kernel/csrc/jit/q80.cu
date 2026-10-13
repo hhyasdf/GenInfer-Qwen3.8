@@ -87,6 +87,76 @@ q80_gemv_kernel(const __grid_constant__ Q80GemvParams params) {
 }
 
 // ---------------------------------------------------------------------------
+// Batched GEMV: Y[m, n] = sum_k X[m, k] * W[n, k],  X bf16 [M, K],
+// W Q8_0 [N, K/32*34] u8, Y bf16/f32 [M, N]. One warp per output row, each
+// lane dequantizes one weight and accumulates all M input rows, so the weight
+// row is read exactly once. M is a template constant (fully unrolled).
+// ---------------------------------------------------------------------------
+
+struct Q80GemvBatchParams {
+  const __nv_bfloat16 *__restrict__ X;
+  const uint8_t *__restrict__ W;
+  __nv_bfloat16 *__restrict__ Y;
+};
+
+template <std::size_t K, std::size_t N, std::size_t M,
+          std::size_t kNumThreads = 128, std::size_t kMaxOccupancy = 1,
+          bool kUsePDL = false, bool kF32Out = false>
+__global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void
+q80_gemv_batch_kernel(const __grid_constant__ Q80GemvBatchParams params) {
+  using namespace device;
+  PDL::wait<kUsePDL>();
+
+  constexpr int kWarpPerBlock = static_cast<int>(kNumThreads) / 32;
+  const int warp_id =
+      static_cast<int>(threadIdx.x) / 32 +
+      static_cast<int>(blockIdx.x) * kWarpPerBlock;
+  const int lane_id = static_cast<int>(threadIdx.x) % 32;
+  if (warp_id >= static_cast<int>(N)) {
+    PDL::launch<kUsePDL>();
+    return;
+  }
+
+  constexpr int n_blocks = static_cast<int>(K) / Q80_K;
+  const BlockQ80 *row = reinterpret_cast<const BlockQ80 *>(
+      params.W + static_cast<size_t>(warp_id) * (n_blocks * Q80_BLOCK_BYTES));
+
+  float acc[M];
+  #pragma unroll
+  for (int m = 0; m < M; m++) acc[m] = 0.0f;
+
+  for (int b = 0; b < n_blocks; b++) {
+    const BlockQ80 &blk = row[b];
+    const float d = __half2float(blk.d);
+    const float w = static_cast<float>(blk.qs[lane_id]) * d;
+    const int pos = b * Q80_K + lane_id;
+    #pragma unroll
+    for (int m = 0; m < M; m++) {
+      acc[m] += w * __bfloat162float(params.X[static_cast<size_t>(m) * K + pos]);
+    }
+  }
+
+  #pragma unroll
+  for (int m = 0; m < M; m++) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      acc[m] += __shfl_down_sync(0xFFFFFFFFu, acc[m], offset);
+    }
+  }
+  if (lane_id == 0) {
+    #pragma unroll
+    for (int m = 0; m < M; m++) {
+      if constexpr (kF32Out) {
+        reinterpret_cast<float *>(params.Y)[static_cast<size_t>(m) * N + warp_id] = acc[m];
+      } else {
+        params.Y[static_cast<size_t>(m) * N + warp_id] = __float2bfloat16(acc[m]);
+      }
+    }
+  }
+  PDL::launch<kUsePDL>();
+}
+
+// ---------------------------------------------------------------------------
 // GEMM: Y[m, n] = sum_k X[m, k] * W[n, k],  X bf16 [M, K],
 // W Q8_0 [N, K/32*34] u8, Y bf16 [M, N].
 // Tile 128 (M) x 128 (N), K-tile 32 (= one Q8_0 block), 256 threads
@@ -294,6 +364,53 @@ struct Q80GemvKernel {
     LaunchKernel(num_blocks, kNumThreads, device)
         .with_attr(kUsePDL)(
             q80_gemv_kernel<K, N, kNumThreads, kMaxOccupancy, kUsePDL>, params);
+  }
+};
+
+template <std::size_t K, std::size_t N, std::size_t M,
+          std::size_t kNumThreads = 128, std::size_t kMaxOccupancy = 1,
+          bool kUsePDL = false, bool kF32Out = false>
+struct Q80GemvBatchKernel {
+  static void run(const tvm::ffi::TensorView X, const tvm::ffi::TensorView W,
+                  const tvm::ffi::TensorView Y) {
+    using namespace host;
+    auto device_ = SymbolicDevice{};
+    auto bf16 = SymbolicDType{};
+    bf16.set_value(kBFloat16DType);
+
+    TensorMatcher({static_cast<int64_t>(M), static_cast<int64_t>(K)})
+        .with_dtype(bf16)
+        .with_device<kDLCUDA>(device_)
+        .verify(X);
+    TensorMatcher({static_cast<int64_t>(N),
+                   static_cast<int64_t>(K / Q80_K * Q80_BLOCK_BYTES)})
+        .with_dtype<uint8_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(W);
+    if constexpr (kF32Out) {
+      TensorMatcher({static_cast<int64_t>(M), static_cast<int64_t>(N)})
+          .with_dtype<float>()
+          .with_device<kDLCUDA>(device_)
+          .verify(Y);
+    } else {
+      TensorMatcher({static_cast<int64_t>(M), static_cast<int64_t>(N)})
+          .with_dtype(bf16)
+          .with_device<kDLCUDA>(device_)
+          .verify(Y);
+    }
+
+    const auto device = device_.unwrap();
+    constexpr int kWarpPerBlock = static_cast<int>(kNumThreads) / 32;
+    const int num_blocks = div_ceil(static_cast<int>(N), kWarpPerBlock);
+    const auto params = Q80GemvBatchParams{
+        .X = static_cast<const __nv_bfloat16 *>(X.data_ptr()),
+        .W = static_cast<const uint8_t *>(W.data_ptr()),
+        .Y = static_cast<__nv_bfloat16 *>(Y.data_ptr()),
+    };
+    LaunchKernel(num_blocks, kNumThreads, device)
+        .with_attr(kUsePDL)(q80_gemv_batch_kernel<K, N, M, kNumThreads,
+                                                  kMaxOccupancy, kUsePDL, kF32Out>,
+                            params);
   }
 };
 

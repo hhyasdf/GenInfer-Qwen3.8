@@ -40,6 +40,10 @@ class EngineConfig:
     layer_split: Tuple[int, ...] | None = None
     # The cuda device index that hosts the draft model (speculative decoding).
     draft_device: int | None = None
+    # Max draft tokens per speculative-decode step (the MTP block runs this many
+    # iterations before the main model verifies the chain). 0 = no spec-decode
+    # (plain decode). Matches the origin's --spec-draft-n-max 4.
+    mtp_n_max: int = 0
     # Explicit device override (e.g. "cuda:1"). When None, the device is
     # derived from the rank (cuda:<rank>), which is correct for the normal
     # multi-process PP/TP startup. The single-process selftest sets this to

@@ -43,6 +43,14 @@ class Q6KLinear(BaseOP):
         if n == 1:
             y = torch.empty(1, N, device=x.device, dtype=x.dtype)
             q6k.q6k_gemv(x.view(K), self.weight, y.view(N))
+        elif n <= 16:
+            # Small-batch verify (spec decode K+1 = 5 tokens): the 128x128 tile
+            # GEMM is catastrophic for n <= 16 (the tile is ~96% empty). The
+            # batched GEMV reads each weight row once while accumulating all n
+            # input rows, so it cuts the n-fold weight re-read of n separate
+            # GEMV launches down to a single read.
+            y = torch.empty(n, N, device=x.device, dtype=x.dtype)
+            q6k.q6k_gemv_batch(x, self.weight, y)
         else:
             y = torch.empty(n, N, device=x.device, dtype=x.dtype)
             q6k.q6k_gemm(x, self.weight, y)
@@ -94,6 +102,11 @@ class Q6KLMHead(BaseOP):
             q6k.q6k_gemv(
                 x.view(self.embedding_dim), self.weight, y.view(self.num_embeddings)
             )
+        elif n <= 16:
+            # Small-batch verify: the 128x128 tile GEMM is catastrophic for n <= 16;
+            # the batched GEMV reads each weight row once while accumulating all n
+            # input rows. y is f32 (logits); the kernel emits f32 from the dtype.
+            q6k.q6k_gemv_batch(x, self.weight, y)
         else:
             q6k.q6k_gemm(x, self.weight, y)
         return y

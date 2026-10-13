@@ -68,8 +68,14 @@ class DetokenizeManager:
         self.eos_token_id = self.tokenizer.eos_token_id
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
-        read_ids: List[List[int]] = []
-        surr_ids: List[List[int]] = []
+        import os
+        if os.environ.get("DETOK_TRACE"):
+            for _m in msgs[:3]:
+                _s = self.decode_map.get(_m.uid)
+                print(f"[detok-trace] uid={_m.uid} next_token={_m.next_token} "
+                      f"decoded_ids_len={len(_s.decoded_ids) if _s else -1} "
+                      f"last5={(_s.decoded_ids[-5:] if _s else [])}", flush=True)
+        incremental_strs: List[str] = []
         for msg in msgs:
             if msg.uid not in self.decode_map:
                 self.decode_map[msg.uid] = DecodeStatus(
@@ -82,15 +88,13 @@ class DetokenizeManager:
             s = self.decode_map[msg.uid]
             if not (msg.finished and msg.next_token == self.eos_token_id):
                 s.decoded_ids.append(msg.next_token)
-            read_ids.append(s.decoded_ids[s.surr_offset :])
-            surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
-
-        read_texts = self.tokenizer.batch_decode(read_ids)
-        surr_texts = self.tokenizer.batch_decode(surr_ids)
-
-        incremental_strs: List[str] = []
-        for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
-            s = self.decode_map[msg.uid]
+            # Decode only the tokens added since the last confirmed boundary.
+            # Offsets advance per message, so a spec-decode step (which bundles
+            # L+1 DetokenizeMsgs for one uid in a single call) never re-emits
+            # the earlier tokens of the same batch; a token whose decode ends in
+            # a surrogate is carried into the next message, as before.
+            read_str = self.tokenizer.decode(s.decoded_ids[s.surr_offset :])
+            surr_str = self.tokenizer.decode(s.decoded_ids[s.surr_offset : s.read_offset])
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status
             if len(new_text) > 0 and not new_text.endswith("�"):
@@ -105,6 +109,9 @@ class DetokenizeManager:
             incremental_output = output_str[s.sent_offset :]
             s.sent_offset = len(output_str)
             incremental_strs.append(incremental_output)
+            if os.environ.get("DETOK_TRACE"):
+                print(f"[detok-out] uid={msg.uid} tok={msg.next_token} "
+                      f"delta={incremental_output!r}", flush=True)
             if msg.finished:
                 del self.decode_map[msg.uid]
 

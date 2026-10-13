@@ -8,7 +8,7 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 import torch
 from minisgl.attention import create_attention_backend
-from minisgl.core import Batch, Context, Req, set_global_ctx
+from minisgl.core import Batch, Context, Req, get_global_ctx, set_global_ctx
 from minisgl.distributed import (
     destroy_distributed,
     enable_pynccl_distributed,
@@ -56,6 +56,11 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Spec-decode only: the per-request number of emitted tokens (L+1 each).
+    # Empty for a normal single-token forward; non-empty when the scheduler
+    # drove the two-forward spec step (forward A + verify B). The scheduler
+    # splits next_tokens_gpu by these counts in _process_last_data.
+    spec_emit_counts: tuple = ()
 
 
 class Engine:
@@ -121,6 +126,37 @@ class Engine:
             self.model.reset_gdn_state(self.device, self.dtype)
             self.ctx.gdn_reset_fn = lambda: self.model.reset_gdn_state(self.device, self.dtype)
 
+        # One-time copy of the front rank's Q80 embedding to the back rank.
+        # The MTP draft block lives on the back rank (GPU1) and embeds its own
+        # draft tokens, but the Q80 embedding matrix lives on the front rank
+        # (GPU0). Copy the raw uint8 weights over the gloo CPU group once at
+        # startup, after load_state_dict (the embedding must be loaded first);
+        # the MTP block then reads self.model.mtp_embed for its token lookups.
+        if config.mtp_n_max > 0 and config.uses_layer_split:
+            from minisgl.layers.q80_linear import Q80Embedding
+
+            vocab = config.model_config.vocab_size
+            hidden = config.model_config.hidden_size
+            if config.is_front_rank:
+                # self.model is Qwen35ForCausalLM; .model is the inner
+                # Qwen35Model; .embed is the front-only Q80Embedding.
+                embed_weight = self.model.model.embed.weight  # [vocab, 544] uint8
+                torch.distributed.send(
+                    embed_weight.detach().to("cpu"),
+                    dst=config.tp_info.rank + 1,
+                    group=self.tp_cpu_group,
+                )
+            else:
+                mtp_embed = Q80Embedding(vocab, hidden)
+                buf = torch.empty_like(mtp_embed.weight, device="cpu")
+                torch.distributed.recv(
+                    buf, src=config.tp_info.rank - 1, group=self.tp_cpu_group
+                )
+                # weight is a plain tensor (BaseOP, not nn.Module): replace the
+                # attribute directly with the received bytes on the device.
+                mtp_embed.weight = buf.to(self.device)
+                self.model.mtp_embed = mtp_embed
+
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
@@ -130,7 +166,12 @@ class Engine:
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
-            num_layers=config.num_full_attn_layers if config.uses_layer_split else None,
+            num_layers=(
+                config.num_full_attn_layers
+                + (1 if config.is_back_rank and config.mtp_n_max > 0 else 0)
+                if config.uses_layer_split
+                else None
+            ),  # +1 KV slot for the MTP draft head (back rank only)
         )
 
         # ======================= Page table initialization ========================
@@ -173,9 +214,10 @@ class Engine:
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
         self.page_table_bytes = self.page_table.numel() * self.page_table.element_size()
-        # With a layer split the rank-to-rank handoff is a blocking gloo
-        # send/recv (a CPU op) and is not CUDA-graph-capturable, so disable
-        # graph capture on split ranks (the decode path falls back to eager).
+        # The layer split's rank-to-rank gloo handoff (a blocking CPU op) is not
+        # CUDA-graph-capturable, so disable graph capture on split ranks (the
+        # decode path falls back to eager). This matches the B5 commit, which
+        # produced clean no-spec decode output.
         graph_bs = [] if config.uses_layer_split else config.cuda_graph_bs
         graph_max_bs = None if config.uses_layer_split else config.cuda_graph_max_bs
         self.graph_runner = GraphRunner(
@@ -387,30 +429,22 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
             if self.config.uses_layer_split and self.config.is_front_rank:
-                # Front rank: run the embedding + the lower layers. The model's
-                # forward hands off (hidden, residual) to the next rank and
-                # returns None (no logits here). The back rank samples and the
-                # next tokens flow back up the chain.
+                # Front rank: run the embedding + the lower layers + gloo handoff.
                 self.model.forward()
-                next_tokens_gpu = self.model.recv_tokens(batch.size)
+                next_tokens_gpu = self.model.recv_tokens(batch.size, tag="D.nxt")
             elif self.config.uses_layer_split and self.config.is_back_rank:
-                # Back rank: receive the handoff, run the upper layers + the
-                # norm + the lm_head, sample, and send the next tokens to the
-                # predecessor rank.
+                # Back rank: gloo handoff + upper layers + norm + lm_head + sample.
                 logits = self.model.forward()
-                # The lm_head already yields one row per request (get_last_indices
-                # reduces the prefill extend block to its last row), so the
-                # sampler consumes the full tensor as-is — no per-token gather.
                 next_tokens_gpu = self.sampler.sample(logits, args).to(torch.int32)
-                self.model.send_tokens(next_tokens_gpu)
+                self.model.send_tokens(next_tokens_gpu, tag="D.nxt")
             elif self.config.uses_layer_split:
                 # Middle rank: receive the handoff from the predecessor, run
                 # the layers this rank owns, and hand off to the successor
                 # (the model's forward does the recv + run + send). Then relay
                 # the sampled tokens from the successor back to the predecessor.
                 self.model.forward()
-                next_tokens_gpu = self.model.recv_tokens(batch.size)
-                self.model.send_tokens(next_tokens_gpu)
+                next_tokens_gpu = self.model.recv_tokens(batch.size, tag="D.rel")
+                self.model.send_tokens(next_tokens_gpu, tag="D.rel")
             else:
                 # No split: run all layers + the norm + the lm_head. Sample.
                 if self.graph_runner.can_use_cuda_graph(batch):
@@ -429,6 +463,352 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def forward_mtp_draft(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        """Spec-decode draft step: the normal decode forward (forward A) plus the
+        MTP draft chain (back rank only).
+
+        Forward A samples x_t (the token for position N+1, where N = cached_len).
+        The back rank then runs the MTP block n_max times to draft the next n_max
+        tokens (positions N+2 .. N+n_max+1). The front rank runs its compute via
+        the CUDA graph (replay_front) when possible — the graph only yields
+        (h, residual), which is all the front rank needs for forward A. The back
+        rank runs the mtp=True path EAGERLY because the graph replay does not
+        expose the pre-norm hidden state the draft chain consumes.
+
+        Returns a ForwardOutput whose next_tokens_gpu holds the K+1 tokens
+        [x_t, d_1, .., d_K] per request (row order = batch order), so the
+        scheduler can scatter them into the token pool and build the verify
+        batch. The per-request accepted length is not known until the verify
+        forward; this method only produces the candidate tokens.
+        """
+        assert torch.cuda.current_stream() == self.stream
+        n_max = self.config.mtp_n_max
+        assert n_max > 0, "forward_mtp_draft requires mtp_n_max > 0"
+        with self.ctx.forward_batch(batch):
+            if self.config.uses_layer_split and self.config.is_front_rank:
+                if self.graph_runner.can_use_cuda_graph(batch):
+                    h, residual = self.graph_runner.replay_front(batch)
+                else:
+                    h, residual = self.model.forward_compute()
+                self.model._send_handoff(h, residual)
+                # Back rank replies with the [x_t, d_1..d_K] block in one
+                # message: the D2H happens only after the draft chain's kernels
+                # have been enqueued, so their launch time overlaps forward A's
+                # GPU execution (two separate synchronous sends used to drain
+                # the forward-A queue before the hops could even be launched).
+                combined = self.model.recv_tokens((n_max + 1) * batch.size, tag="A.drafts")
+                x_t_gpu = combined[: batch.size]  # [size]
+                drafts_gpu = combined[batch.size :]  # [size*n_max]
+            elif self.config.uses_layer_split and self.config.is_back_rank:
+                assert self.model.mtp is not None, (
+                    "forward_mtp_draft requires the MTP block on the back rank"
+                )
+                h, residual = self.model._recv_handoff(batch.input_ids.shape[0])
+                # EAGER: the graph replay returns only logits, not the pre-norm
+                # hidden state the draft chain consumes.
+                logits, pre_norm = self.model.forward_compute(h, residual, mtp=True)
+                x_t_gpu = self.sampler.sample(logits, args).to(torch.int32)  # [size]
+                # Draft chain (back rank only): one token per request per hop.
+                # base_position = position of x_t = cached_len + 1. The hops
+                # enqueue behind forward A on the same stream, so their CPU
+                # launch time overlaps forward A's GPU execution.
+                drafts_gpu = torch.empty(
+                    n_max * batch.size, dtype=torch.int32, device=self.device
+                )
+                for i, req in enumerate(batch.reqs):
+                    base_position = req.cached_len + 1
+                    d = self.model.draft_mtp_chain(
+                        x_t_gpu[i : i + 1], pre_norm[i : i + 1], base_position, n_max,
+                        req.table_idx,
+                    )
+                    drafts_gpu[i * n_max : (i + 1) * n_max] = d
+                # One D2H + one gloo send for the [x_t, d_1..d_K] block (was
+                # two synchronous sends: the first drained the forward-A queue
+                # before the hops could even be launched).
+                self.model.send_tokens(
+                    torch.cat([x_t_gpu, drafts_gpu]), tag="A.drafts"
+                )
+            else:
+                raise RuntimeError("forward_mtp_draft requires a 2-rank layer split")
+        # Combine [x_t] and [d_1..d_K] into one [size, n_max+1] tensor row-major:
+        # row i = [x_t_i, d_1_i, .., d_K_i]. The scheduler flattens to the
+        # token pool as the K+1 verify tokens for request i.
+        tokens_gpu = torch.empty(
+            batch.size * (n_max + 1), dtype=torch.int32, device=self.device
+        )
+        # Reshape to [size, n_max+1] so the scatter is row-major: row i =
+        # [x_t_i, d_1_i, .., d_K_i]. A strided slice like tokens_gpu[1::n_max+1]
+        # would only select each row's d_1 slot (size `size`) and mismatch the
+        # [size*n_max] drafts buffer.
+        rows = tokens_gpu.view(batch.size, n_max + 1)
+        rows[:, 0] = x_t_gpu
+        rows[:, 1:] = drafts_gpu.view(batch.size, n_max)
+        next_tokens_cpu = tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+        return ForwardOutput(tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def forward_mtp_verify(
+        self,
+        verify_batch: Batch,
+        args: BatchSamplingArgs,
+    ) -> ForwardOutput:
+        """Spec-decode verify step: the verification forward (forward B).
+
+        verify_batch holds K+1 tokens per request at positions N+1 .. N+K+1
+        ([x_t, d_1, .., d_K]), phase "prefill", reduce=False so the lm_head
+        keeps every row (one logit row per draft token). The verification
+        forward produces one logit row per token; the row from the token at
+        position N+1+j predicts position N+2+j. On the back rank we accept the
+        matching prefix of draft tokens and emit L+1 tokens (x_t + d_1..d_L).
+        The bonus row (from d_K) is NEVER emitted by this step — it is the
+        output of the NEXT forward A, which consumes d_L and generates N+L+2.
+
+        GDN state fix-up: snapshot conv_buf + S of all 48 GDN layers BEFORE
+        forward B (state = GDN(N)); forward B over-advances to GDN(N+K+1)
+        (wrong when L<K); after acceptance restore the snapshot and re-run the
+        conv1d + delta-rule recurrence on the first L verify inputs so the state
+        is exactly GDN(N+L). The next forward A then consumes d_L.
+
+        Returns a ForwardOutput whose next_tokens_gpu holds the L+1 emitted
+        tokens per request (row order = batch order) and whose
+        next_tokens_cpu is the same. The scheduler uses the per-request length
+        to advance req.cached_len / req.device_len by L+1.
+        """
+        assert torch.cuda.current_stream() == self.stream
+        n_max = self.config.mtp_n_max
+        assert n_max > 0, "forward_mtp_verify requires mtp_n_max > 0"
+        k_plus_1 = n_max + 1
+        # NOTE: Batch.size is len(reqs), NOT the token count. The verify batch
+        # holds K+1 tokens per request, so check the input_ids length.
+        num_verify_tokens = verify_batch.input_ids.shape[0]
+        assert num_verify_tokens == len(verify_batch.reqs) * k_plus_1, (
+            f"verify batch must hold {k_plus_1} tokens per request, got "
+            f"{num_verify_tokens} tokens for {len(verify_batch.reqs)} requests"
+        )
+        with self.ctx.forward_batch(verify_batch):
+            if self.config.uses_layer_split and self.config.is_front_rank:
+                # Forward B is a prefill-shaped forward (K+1 tokens per request)
+                # so it is NOT graph-capturable (only decode sizes are captured).
+                # The front rank runs its lower layers eagerly, hands off, and
+                # waits for the back rank's acceptance verdict + emitted tokens.
+                #
+                # Forward B over-advances the FRONT rank's own GDN recurrent
+                # state exactly like the back rank's (the front rank owns the
+                # lower GDN layers, e.g. ids 0,1,2,4,5,6,... of the split). The
+                # back-rank fix-up below restores only the back rank's state;
+                # without a symmetric front-rank fix-up the next forward A (a
+                # graph replay) consumes an over-advanced recurrent state and
+                # emits garbage. Snapshot + re-run on the accepted prefix,
+                # mirroring the back rank. The fix-up is only correct for one
+                # in-flight request (the GDN state is one global tensor per
+                # layer); the bench is latency-1, and the back rank already
+                # asserts this invariant.
+                ctx = get_global_ctx()
+                snapshot = {}
+                for layer in self.model.model.layers:
+                    if not layer.is_full_attn:
+                        st = ctx.gdn_state[layer.layer_id]
+                        snapshot[layer.layer_id] = (
+                            st.conv_buf.clone(),
+                            st.S.clone(),
+                        )
+                for layer in self.model.model.layers:
+                    if not layer.is_full_attn:
+                        layer.attn.verify_save = {}
+                h, residual = self.model.forward_compute()
+                self.model._send_handoff(h, residual)
+                # Back rank replies with the per-request accepted length, then
+                # the flat emitted tokens (L_i+1 tokens for request i).
+                accepted_gpu = self.model.recv_tokens(len(verify_batch.reqs), tag="B.acc")  # [size]
+                total_emitted = int(accepted_gpu.sum().item()) + len(verify_batch.reqs)
+                emitted_gpu = self.model.recv_tokens(total_emitted, tag="B.emit")
+                # Front-rank GDN fix-up (mirror of the back rank's below):
+                # restore the pre-forward-B snapshot, then re-advance the
+                # recurrence on the first L0 accepted verify tokens.
+                L0 = int(accepted_gpu[0].item())
+                for layer in self.model.model.layers:
+                    if not layer.is_full_attn:
+                        st = ctx.gdn_state[layer.layer_id]
+                        conv_buf, S = snapshot[layer.layer_id]
+                        # IN PLACE: the front rank's forward A is a graph replay,
+                        # so the captured pointer to st.conv_buf / st.S is baked
+                        # in. Reassigning (conv_buf = clone()) would reintroduce
+                        # the pointer-staleness bug fixed on the no-spec path;
+                        # copy the pre-forward-B snapshot back into the live
+                        # tensors instead. (The back rank reassigns safely
+                        # because its forward A is eager.)
+                        st.conv_buf.copy_(conv_buf)
+                        st.S.copy_(S)
+                        vs = layer.attn.verify_save
+                        if L0 > 0:
+                            layer.attn.rereun_recurrence(
+                                vs["qkv"][:L0], vs["gate"][:L0], vs["beta"][:L0], st
+                            )
+                        layer.attn.verify_save = None
+            elif self.config.uses_layer_split and self.config.is_back_rank:
+                # PHASE TIMING (diagnostic only, SPEC_PHASE_TIMING=1): CUDA
+                # events bracket each phase; elapsed_time is GPU-stream time.
+                import os as _os
+                _pt = _os.environ.get("SPEC_PHASE_TIMING") == "1"
+                _evs = [torch.cuda.Event(enable_timing=True) for _ in range(8)] if _pt else None
+                if _evs is not None:
+                    _evs[0].record()
+                assert self.model.mtp is not None, (
+                    "forward_mtp_verify requires the MTP block on the back rank"
+                )
+                h, residual = self.model._recv_handoff(verify_batch.input_ids.shape[0])
+                if _evs is not None:
+                    _evs[1].record()
+                # GDN snapshot BEFORE forward B (state = GDN(N)).
+                ctx = get_global_ctx()
+                snapshot = {}
+                for layer in self.model.model.layers:
+                    if not layer.is_full_attn:
+                        st = ctx.gdn_state[layer.layer_id]
+                        snapshot[layer.layer_id] = (
+                            st.conv_buf.clone(),
+                            st.S.clone(),
+                        )
+                # Enable per-token save in every GDN layer for the fix-up.
+                for layer in self.model.model.layers:
+                    if not layer.is_full_attn:
+                        layer.attn.verify_save = {}
+                if _evs is not None:
+                    _evs[2].record()
+                # Forward B: keep every draft token's logit row (reduce=False)
+                # and the pre-norm hidden state (mtp=True) for the MTP rebuild.
+                logits, pre_norm = self.model.forward_compute(h, residual, mtp=True, reduce=False)
+                if _evs is not None:
+                    _evs[3].record()
+                # Rebuild the MTP (nextn) KV slots N+1..N+K with the true hidden
+                # states: slot p = (token_{p+1}, h_p). The draft chain's slots are
+                # stale (built from its own hiddens); the next chain reads this
+                # cache as its prefix.
+                self.model._mtp_populate(verify_batch.input_ids, pre_norm, verify_batch)
+                if _evs is not None:
+                    _evs[4].record()
+                # logits: [size, vocab] = [size*(K+1), vocab]. Row for the token
+                # at position N+1+j predicts position N+2+j. So the row for
+                # x_t (j=0) predicts d_1; the row for d_i (j=i) predicts d_{i+1}.
+                # Acceptance: v_j = argmax(logits[req_i * (K+1) + j]); accept d_j
+                # (the j-th draft, j=1..K) iff v_{j-1} == d_j. L = first j in
+                # 1..K where v_{j-1} != d_j, minus 1 (or K if all match).
+                size = len(verify_batch.reqs)
+                # The GDN recurrent state is a single GLOBAL per-layer tensor
+                # (shared across requests), so the post-verify fix-up below is
+                # only correct for one in-flight request. The bench is
+                # latency-1; guard the invariant here.
+                assert size == 1, (
+                    "forward_mtp_verify GDN fix-up requires concurrency 1 "
+                    f"(got {size} in-flight requests)"
+                )
+                # Acceptance, computed on GPU: the leading-True length of eq is
+                # a cumsum/argmax, so the ONLY GPU->CPU sync in the verify step
+                # is the single L read below. (The per-j bool(eq[j]) loop used
+                # to issue one .item() per draft; the first one drained the
+                # whole forward-B queue, and each later one re-synced.)
+                base = 0
+                d_rows = verify_batch.input_ids[base + 1 : base + 1 + n_max]  # [K]
+                v_pred = logits[base : base + n_max].argmax(dim=-1)  # [K]
+                eq = v_pred == d_rows  # [K] bool, on GPU
+                # L = number of leading Trues of eq. cumprod stays 1 until the
+                # first False, then 0 forever: sum(cumprod) is exactly the
+                # leading-True count (all-True -> K, all-False -> 0). All GPU
+                # kernels, no tensor creation — the old torch.where form built
+                # torch.tensor(n_max, device=cuda) every step, a pageable H2D
+                # that parked the back rank ~1.2 s/step (py-spy: 71% of samples
+                # at engine.py:710).
+                L_gpu = eq.to(torch.int32).cumprod(-1).sum()
+                # The one sync of the step: read L. Everything forward B
+                # produced (logits, MTP populate, GDN snapshot) completes here.
+                L = int(L_gpu.item())
+                if _evs is not None:
+                    _evs[5].record()
+                # --- spec token dump (diagnostic, env-gated) -------------------
+                import os as _os_t
+                if _os_t.environ.get("SPEC_TOKEN_DUMP") == "1":
+                    global _SPEC_DUMP_N
+                    try:
+                        _SPEC_DUMP_N
+                    except NameError:
+                        _SPEC_DUMP_N = 0
+                    if _SPEC_DUMP_N < 12:
+                        _SPEC_DUMP_N += 1
+                        import sys as _sys_t
+                        _vids = verify_batch.input_ids[:base + 1 + n_max].tolist()
+                        _vpre = v_pred.tolist()
+                        _eqs = eq.tolist()
+                        try:
+                            _tok = load_tokenizer(self.config.model_path)
+                            _vtxt = _tok.decode(_vids)
+                            _ptxt = _tok.decode(_vpre)
+                        except Exception as _e:
+                            _vtxt = f"<decode-fail:{_e}>"
+                            _ptxt = _vtxt
+                        _d1_eq_xt = _vids[1] == _vids[0] if len(_vids) > 1 else None
+                        print(
+                            f"[spec-dump {_SPEC_DUMP_N}] L={L} d1==xt={_d1_eq_xt}\n"
+                            f"  verify(x_t,d_1..d_K) ids={_vids}\n"
+                            f"  verify text={_vtxt!r}\n"
+                            f"  v_pred(argmax) ids={_vpre}\n"
+                            f"  v_pred text={_ptxt!r}\n"
+                            f"  eq={_eqs}",
+                            file=_sys_t.stderr, flush=True,
+                        )
+                # ----------------------------------------------------------------
+                accepted_cpu = torch.tensor([L], dtype=torch.int32)  # CPU
+                # Emit x_t + d_1..d_L (L+1 tokens).
+                emitted_gpu = verify_batch.input_ids[base : base + 1 + L].to(torch.int32)
+                # Relay the acceptance verdict + emitted tokens to the front rank.
+                self.model.send_tokens(accepted_cpu, tag="B.acc")
+                self.model.send_tokens(emitted_gpu, tag="B.emit")
+                if _evs is not None:
+                    _evs[6].record()
+                # GDN fix-up. The verify forward ALWAYS over-advances the global
+                # GDN state to GDN(N+K+1) (it processes all K+1 verify tokens),
+                # so the snapshot (GDN(N)) must ALWAYS be restored -- even when
+                # L=0, otherwise the next forward A consumes a corrupt state and
+                # emits garbage. The recurrence re-processes the accepted prefix
+                # (x_t, d_1..d_{L-1}; L tokens) only when L>0; when L=0 the next
+                # forward A re-processes x_t from the restored snapshot, so the
+                # state is just GDN(N). With concurrency 1 the global GDN state
+                # is the single request's state, so the fix-up is on the first L
+                # tokens of the (single) verify batch.
+                L0 = int(accepted_cpu[0].item())
+                for layer in self.model.model.layers:
+                    if not layer.is_full_attn:
+                        st = ctx.gdn_state[layer.layer_id]
+                        conv_buf, S = snapshot[layer.layer_id]
+                        st.conv_buf = conv_buf.clone()
+                        st.S.copy_(S)
+                        vs = layer.attn.verify_save
+                        if L0 > 0:
+                            layer.attn.rereun_recurrence(
+                                vs["qkv"][:L0], vs["gate"][:L0], vs["beta"][:L0], st
+                            )
+                        layer.attn.verify_save = None
+                if _evs is not None:
+                    _evs[7].record()
+                    _evs[7].synchronize()
+                    import sys as _sys
+                    _names = ["recv", "snap+save", "fwdB", "mtp_pop", "accept+L", "send", "fixup"]
+                    _ph = " ".join(
+                        f"{_names[i]}={_evs[i].elapsed_time(_evs[i + 1]):.1f}" for i in range(7)
+                    )
+                    print(f"[phase-ms] {_ph} (L={L})", file=_sys.stderr, flush=True)
+            else:
+                raise RuntimeError("forward_mtp_verify requires a 2-rank layer split")
+        next_tokens_cpu = emitted_gpu.to("cpu", non_blocking=True)
+        if os.environ.get("ENGINE_RET_TRACE") == "1" and not self.config.is_back_rank:
+            import sys as _sys
+            torch.cuda.synchronize()
+            _ids = next_tokens_cpu.tolist()
+            print(f"[engine-ret N] ids={_ids} len={len(_ids)}", file=_sys.stderr, flush=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+        return ForwardOutput(emitted_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()

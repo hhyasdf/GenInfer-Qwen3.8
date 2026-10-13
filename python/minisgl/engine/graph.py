@@ -88,6 +88,8 @@ class GraphRunner:
         max_seq_len: int,
         vocab_size: int,
         dummy_req: Req,
+        hidden_size: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -96,6 +98,8 @@ class GraphRunner:
         )
         self.attn_backend = attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
+        self.hidden_size = hidden_size
+        self.dtype = dtype
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
         self.stream = stream

@@ -55,6 +55,9 @@ def _config_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
         defaults["cache_type"] = perf["cache_type"]
     if "cuda_graph_max_bs" in perf:
         defaults["cuda_graph_max_bs"] = perf["cuda_graph_max_bs"]
+    speculative = cfg.get("speculative", {})
+    if "n_max" in speculative:
+        defaults["mtp_n_max"] = speculative["n_max"]
     if "max_prefill_length" in perf:
         defaults["max_extend_tokens"] = perf["max_prefill_length"]
     serving = cfg.get("serving", {})
@@ -209,6 +212,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=int,
         default=d("draft_device", None),
         help="The cuda device index that hosts the draft model (speculative decoding).",
+    )
+
+    parser.add_argument(
+        "--mtp-n-max",
+        type=int,
+        dest="mtp_n_max",
+        default=d("mtp_n_max", 0),
+        help="Max MTP draft tokens per speculative-decode step (0 = no spec-decode). "
+        "Matches the origin's --spec-draft-n-max.",
     )
 
     parser.add_argument(

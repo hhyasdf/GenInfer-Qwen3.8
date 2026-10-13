@@ -44,6 +44,14 @@ class Q80Linear(BaseOP):
         if n == 1:
             y = torch.empty(1, N, device=x.device, dtype=x.dtype)
             q80.q80_gemv(x.view(K), self.weight, y.view(N))
+        elif n <= 16:
+            # Small-batch verify (spec decode K+1 = 5 tokens): the 128x128 tile
+            # GEMM is catastrophic for n <= 16 (the tile is ~96% empty). The
+            # batched GEMV reads each weight row once while accumulating all n
+            # input rows, so it cuts the n-fold weight re-read of n separate
+            # GEMV launches down to a single read.
+            y = torch.empty(n, N, device=x.device, dtype=x.dtype)
+            q80.q80_gemv_batch(x, self.weight, y)
         else:
             y = torch.empty(n, N, device=x.device, dtype=x.dtype)
             q80.q80_gemm(x, self.weight, y)
@@ -76,12 +84,12 @@ class Q80LMHead(BaseOP):
         )
 
     @nvtx_annotate("Q80LMHead")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reduce: bool = True) -> torch.Tensor:
         from minisgl.core import get_global_ctx
         from minisgl.kernel import q80
 
         batch = get_global_ctx().batch
-        if batch.is_prefill:
+        if reduce and batch.is_prefill:
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
             del indices
@@ -92,6 +100,11 @@ class Q80LMHead(BaseOP):
             q80.q80_gemv(
                 x.view(self.embedding_dim), self.weight, y.view(self.num_embeddings)
             )
+        elif n <= 16:
+            # Small-batch verify: the 128x128 tile GEMM is catastrophic for n <= 16;
+            # the batched GEMV reads each weight row once while accumulating all n
+            # input rows. y is bf16 here; the kernel emits bf16 from the dtype.
+            q80.q80_gemv_batch(x, self.weight, y)
         else:
             q80.q80_gemm(x, self.weight, y)
         return y

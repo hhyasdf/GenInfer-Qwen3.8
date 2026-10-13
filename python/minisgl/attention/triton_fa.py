@@ -32,6 +32,7 @@ import triton.language as tl
 from minisgl.core import Batch, get_global_ctx
 
 from .base import BaseAttnBackend, BaseAttnMetadata
+from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
@@ -219,6 +220,9 @@ class TritonFABackend(BaseAttnBackend):
         self.kvcache = ctx.kv_cache
         self.page_size = ctx.page_size
         self.scale = config.head_dim**-0.5
+        self.capture: BaseCaptureData | None = None
+        self.max_graph_bs = 0
+        self.capture_bs: List[int] = []
         # Tile sizes are bounded by shared memory per block:
         # sm_75 (Turing) 64 KB -> 32x32 tiles for D=256 (48 KB);
         # sm_80+ (Ada/Hopper) ~99 KB -> 64x32 tiles (64 KB).
@@ -341,10 +345,32 @@ class TritonFABackend(BaseAttnBackend):
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
-        raise AssertionError("CUDA graphs are disabled in layer-split mode")
+        assert self.capture is None, "Capture already initialized."
+        max_bs = max(bs_list)
+        capture = BaseCaptureData.create(max_bs, max_seq_len // self.page_size, self.kvcache.device)
+        self.max_graph_bs = max_bs
+        self.capture = capture
+        self.capture_bs = sorted(bs_list)
 
     def prepare_for_capture(self, batch: Batch) -> None:
-        raise AssertionError("CUDA graphs are disabled in layer-split mode")
+        assert (bs := batch.size) in self.capture_bs and self.capture
+        capture = self.capture
+        metadata = TritonFAMetadata(
+            cu_seqlens_k=capture.cu_seqlens_k[: bs + 1],
+            cu_seqlens_q=capture.cu_seqlens_q[: bs + 1],
+            cache_seqlens=capture.seq_lens[:bs],
+            max_seqlen_k=capture.page_table.size(1) * self.page_size,
+            max_seqlen_q=1,  # decode only
+            page_table=capture.page_table[:bs, :],
+        )
+        batch.attn_metadata = metadata
 
     def prepare_for_replay(self, batch: Batch) -> None:
-        raise AssertionError("CUDA graphs are disabled in layer-split mode")
+        metadata, bs = batch.attn_metadata, batch.padded_size
+        assert isinstance(metadata, TritonFAMetadata)
+        assert self.capture is not None and bs in self.capture_bs
+        # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
+        table_len = metadata.page_table.size(1)
+        self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
+        self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
+        self.capture.page_table[:bs, :table_len].copy_(metadata.page_table)

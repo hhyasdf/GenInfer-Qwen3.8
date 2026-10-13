@@ -31,6 +31,18 @@ def _gemv_module(K: int, N: int, f32_out: bool):
 
 
 @functools.cache
+def _gemv_batch_module(K: int, N: int, M: int, f32_out: bool):
+    config = KernelConfig(num_threads=128, max_occupancy=1, use_pdl=False)
+    args = make_cpp_args(K, N, M, *config, f32_out)
+    return load_jit(
+        "q6k_gemv_batch",
+        *args,
+        cuda_files=["q6k.cu"],
+        cuda_wrappers=[("run", f"Q6KGemvBatchKernel<{args}>::run")],
+    )
+
+
+@functools.cache
 def _gemm_module(K: int, N: int, f32_out: bool):
     config = KernelConfig(num_threads=256, max_occupancy=1, use_pdl=False)
     args = make_cpp_args(K, N, *config, f32_out)
@@ -66,6 +78,24 @@ def q6k_gemv(
     K = x.shape[0]
     N = y.shape[0]
     _gemv_module(K, N, y.dtype == torch.float32).run(x, W, y)
+
+
+def q6k_gemv_batch(
+    X: torch.Tensor,  # [M, K] bf16
+    W: torch.Tensor,  # [N, K // 256 * 210] uint8 (Q6_K)
+    Y: torch.Tensor,  # [M, N] bf16 or f32
+) -> None:
+    """Q6_K batched GEMV: Y[m, n] = sum_k X[m, k] * W[n, k].
+
+    One warp per output row accumulates all M input rows while reading each
+    weight row exactly once. For the small M produced by spec-decode verify
+    (M = K_spec+1, e.g. 5) this reads the weights ~M times less than M
+    separate q6k_gemv launches, which dominate the small-batch verify step.
+    Output dtype is taken from ``Y``: bf16 for activations, f32 for logits.
+    """
+    M, K = X.shape
+    N = Y.shape[1]
+    _gemv_batch_module(K, N, M, Y.dtype == torch.float32).run(X, W, Y)
 
 
 def q6k_gemm(
