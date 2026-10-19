@@ -75,6 +75,24 @@ def main():
             raise AssertionError("should have raised")
         except PPLayerPartitionError:
             pass
+        # R4 fix ②: 完整 4 维 VRAM 预算重算 (代码显式公式, 非注释估算) —
+        # 28/36 必须满足两卡安全线 (15.1 / 21.1 GiB); D 维 = 每-GEMM bf16 反量化
+        # 权重 (fix ① 低温路径), 不再是 R3 的 f32+int64 ~4.5GB。
+        from engine.pp_layer_partition import (check_partition_budget,
+                                               compute_pp_layer_partition_budgeted)
+        budgets = check_partition_budget(p)
+        assert len(budgets) == 2 and all(b["fit"] for b in budgets)
+        GiB = 1024 ** 3
+        assert budgets[0]["total"] <= 15.1 * GiB, \
+            f"stage0 预算 {budgets[0]['total'] / GiB:.2f} GiB > 15.1"
+        assert budgets[1]["total"] <= 21.1 * GiB, \
+            f"stage1 预算 {budgets[1]['total'] / GiB:.2f} GiB > 21.1"
+        # D 维钉死为每-GEMM bf16: stage0 = FFN 5120×17408×2B, stage1 = LMHead 248320×5120×2B
+        assert budgets[0]["D"] == 5120 * 17408 * 2
+        assert budgets[1]["D"] == 248320 * 5120 * 2
+        # 预算化切层与纯切层一致 (28/36 满足安全线 → 骨架保留)
+        p_b = compute_pp_layer_partition_budgeted(64, 2, vram_ratio=1.25)
+        assert p_b == p
     check("pp_layer_partition", k3)
 
     # 4) PP KV (Phase 13b)

@@ -195,3 +195,146 @@ def get_mtp_block(partition: list, mtp_layer: int) -> list[str]:
         f"blk.{mtp_layer}.nextn.shared_head_norm.weight",
     ]
     return names
+
+
+# ===========================================================================
+# Round-4 fix ② — 完整 4 维 VRAM 预算切层公式 (代码显式, self_check k3 可重算)。
+#
+# R3 根因: vram_ratio 只按权重大小切层 (stage0 10.16GiB / stage1 13.13GiB), 未给
+# dequant 临时 + 激活 + KV + GDN state 留预算 → stage0 的 16GB 卡在 prefill 最大
+# FFN GEMM 的旧 dequant (f32 out + int64 ql/qh, ~4.5GB 临时) 触顶 → 0 token。
+# R4 fix ① 低温 dequant 后 dequant 临时 = 每-GEMM bf16 权重 (stage0 峰值 FFN 170MB)。
+#
+# 每 stage 预算 = W (权重, 精确账本) + D (dequant 临时峰) + A (激活峰)
+#                + K (KV cache 配额, q8_0 2176B/token/FA 层) + G (GDN 循环状态)。
+# 数据来源: gguf_fields_values.txt 维度 + gguf_dump n_bytes 逐张量精确账本
+#           (exploration_report.md R2 ⑥ / R3 方向 ①) + AGGREGATE_REPORT_R3.md
+#           VRAM 采样 (R3 GPU0 峰值 15975MiB 死因)。
+# ===========================================================================
+Q6_K_BPP = 210 / 256              # Q6_K 0.8203125 B/elem (210B/256elem 超级块)
+Q8_0_BPP = 34 / 32                # Q8_0 1.0625 B/elem (34B/32elem 块)
+KV_BPE_Q8_0 = 1 + 1 / 32          # llama-server --cache-type-k/v q8_0: 1.0625 B/elem
+KV_BYTES_PER_TOKEN_FA = 2 * 4 * 256 * KV_BPE_Q8_0   # (K+V)×kv_heads×head_dim = 2176 B/token/FA 层
+GDN_LAYER_BYTES = 315_147_136     # GDN 块 14 张量 packed 字节 (gguf_dump n_bytes 实测)
+FA_LAYER_BYTES = 305_399_808      # FA 块 11 张量 packed 字节 (gguf_dump n_bytes 实测)
+TOKEN_EMBD_BYTES = 1_350_860_800  # token_embd Q8_0 [248320,5120] (仅首 stage)
+OUTPUT_NORM_BYTES = 20_480        # output_norm F32 [5120] (仅末 stage; 账本闭环时记 stage0,
+                                  # 实际绑定末 stage — weight_loader _collect_names is_last)
+MTP_BLOCK_BYTES = 451_319_808     # MTP blk.64 15 张量 Q8_0+F32 (仅末 stage)
+LMHEAD_BYTES = 1_350_860_800      # output.weight Q8_0 [248320,5120] (仅末 stage)
+HIDDEN_SIZE = 5120                # gguf qwen35.embedding_length
+FFN_SIZE = 17408                  # gguf qwen35.feed_forward_length
+VOCAB_SIZE = 248320               # token_embd 行数
+KV_HEADS = 4                      # gguf qwen35.attention.head_count_kv
+HEAD_DIM = 256                    # gguf qwen35.attention.key_length/value_length
+SSM_STATE_BYTES = 48 * 128 * 128 * 4   # GDN 循环状态 [n_v=48,dk=128,dv=128] f32 = 3,145,728 B (常数)
+DEFAULT_MAX_BATCH = 4             # 引擎 max_num_seqs 默认
+DEFAULT_MAX_PREFILL_SEQ = 2048    # 单步 prefill token 包络 (E2E 24-token 生成远小于此)
+STAGE0_SAFETY_GIB = 15.1          # 4070TiS 16GB 卡安全线 (exploration R2 ⑥: 可用 ~15.1 GiB)
+STAGE1_SAFETY_GIB = 21.1          # 2080Ti 22.5GB 卡安全线 (可用 ~21.1 GiB)
+
+
+def stage_vram_budget(stage_layers: list, full_attention_interval: int = 4,
+                      is_first: bool = False, is_last: bool = False,
+                      max_batch: int = DEFAULT_MAX_BATCH,
+                      max_prefill_seq: int = DEFAULT_MAX_PREFILL_SEQ) -> dict:
+    """单 stage 4 维 VRAM 预算 (bytes): W 权重 + D dequant 临时峰 + A 激活峰
+    + K KV cache 配额 + G GDN 循环状态。显式公式, 纯算术, CPU 可重算 (self_check k3)。
+      W = n_gdn×315,147,136 + n_fa×305,399,808 + stage 专属张量
+          (首: token_embd 1,350,860,800; 末: MTP 451,319,808 + LMHead 1,350,860,800
+           + output_norm 20,480)
+      D = max GEMM 的 bf16 反量化权重 = hidden×ffn×2B (FFN, 非末 stage 峰值);
+          末 stage 另比 LMHead vocab×hidden×2B (decode 每步 logits GEMM)
+      A = max_batch×max_prefill_seq×(hidden+ffn)×2B (隐藏态 + FFN 中间激活;
+          attention 走 flash SDPA, 不物化 seq² 分数矩阵)
+      K = n_fa×max_prefill_seq×2176 B (q8_0 KV; 引擎 PPKVCache 若以 bf16 驻留
+          则为 2× 此项 — 仍远小于安全线裕度)
+      G = n_gdn×3,145,728 B (f32 循环状态, 常数, 不随 seq 增长)
+    """
+    n_fa = sum(1 for il in stage_layers if is_full_attention(il, full_attention_interval))
+    n_gdn = len(stage_layers) - n_fa
+    W = n_gdn * GDN_LAYER_BYTES + n_fa * FA_LAYER_BYTES
+    if is_first:
+        W += TOKEN_EMBD_BYTES
+    if is_last:
+        W += MTP_BLOCK_BYTES + LMHEAD_BYTES + OUTPUT_NORM_BYTES
+    D = HIDDEN_SIZE * FFN_SIZE * 2
+    if is_last:
+        D = max(D, VOCAB_SIZE * HIDDEN_SIZE * 2)
+    A = max_batch * max_prefill_seq * (HIDDEN_SIZE + FFN_SIZE) * 2
+    K = n_fa * max_prefill_seq * int(KV_BYTES_PER_TOKEN_FA)
+    G = n_gdn * SSM_STATE_BYTES
+    return {"W": W, "D": D, "A": A, "K": K, "G": G,
+            "total": W + D + A + K + G, "n_fa": n_fa, "n_gdn": n_gdn}
+
+
+def check_partition_budget(partition: list, capacities_gib: list = None,
+                           full_attention_interval: int = 4,
+                           max_batch: int = DEFAULT_MAX_BATCH,
+                           max_prefill_seq: int = DEFAULT_MAX_PREFILL_SEQ) -> list:
+    """逐 stage 校验 4 维预算 ≤ 对应卡安全线。capacities_gib 缺省 = evo-001 异构双卡
+    (15.1, 21.1) GiB。任一 stage 越线 → PPLayerPartitionError (PP-PART-006,
+    消息含越线 stage 与各维 bytes, 供调用方重新切层)。返回各 stage 预算 dict 列表。"""
+    caps = list(capacities_gib) if capacities_gib else [STAGE0_SAFETY_GIB, STAGE1_SAFETY_GIB]
+    if len(caps) != len(partition):
+        raise PPLayerPartitionError(
+            f"PP-PART-006: capacities 给 {len(caps)} 条但 partition 有 {len(partition)} 个 stage")
+    GiB = 1024 ** 3
+    report = []
+    for i, seg in enumerate(partition):
+        b = stage_vram_budget(seg, full_attention_interval,
+                              is_first=(i == 0), is_last=(i == len(partition) - 1),
+                              max_batch=max_batch, max_prefill_seq=max_prefill_seq)
+        limit = caps[i] * GiB
+        b["limit_gib"] = caps[i]
+        b["margin_gib"] = (limit - b["total"]) / GiB
+        b["fit"] = b["total"] <= limit
+        report.append(b)
+        if b["total"] > limit:
+            raise PPLayerPartitionError(
+                f"PP-PART-006: stage{i} 预算 {b['total'] / GiB:.2f} GiB "
+                f"(W={b['W'] / GiB:.2f} D={b['D'] / GiB:.2f} A={b['A'] / GiB:.2f} "
+                f"K={b['K'] / GiB:.3f} G={b['G'] / GiB:.3f}) > 安全线 {caps[i]} GiB "
+                f"— 需减该 stage 层数或降包络")
+    return report
+
+
+def compute_pp_layer_partition_budgeted(num_layers: int, pp_size: int,
+                                        full_attention_interval: int = 4,
+                                        vram_ratio: float = 1.0,
+                                        capacities_gib: list = None) -> list:
+    """Round-4 fix ②: 先按 vram_ratio 切 (28/36 骨架), 再整 4 维 VRAM 预算校验。
+    任一 stage 越安全线 → 按预算重推边界 (仅 pp_size=2 支持: 枚举全部 FA 对齐边界,
+    保留满足两卡安全线且最接近 vram_ratio 骨架者); 无可行边界 → PPLayerPartitionError。
+    evo-001 模型 28/36 满足两卡安全线 (stage0 ~10.01GiB ≤ 15.1 / stage1 ~14.99GiB ≤ 21.1)
+    → 原样返回 28/36 (R3 骨架保留)。
+    pp_size=1 → 非 evo-001 异构双卡预算范围 → 直通 (不做容量校验)。
+    capacities_gib: 各 stage 安全线 (GiB), 缺省 (15.1, 21.1)。"""
+    part = compute_pp_layer_partition(num_layers, pp_size, full_attention_interval, vram_ratio)
+    if pp_size == 1:
+        return part
+    try:
+        check_partition_budget(part, capacities_gib, full_attention_interval)
+        return part
+    except PPLayerPartitionError:
+        pass
+    if pp_size != 2:
+        raise PPLayerPartitionError(
+            f"PP-PART-006: 预算越线且 pp_size={pp_size} 不支持边界重推 (仅 pp_size=2)")
+    # FA 对齐边界枚举: 边界必在 FA 层之后 → split ≡ 0 (mod interval), split ∈ [interval, num_layers-interval]
+    best, best_dev = None, None
+    for split in range(full_attention_interval,
+                       num_layers - full_attention_interval + 1,
+                       full_attention_interval):
+        cand = [list(range(0, split)), list(range(split, num_layers))]
+        try:
+            check_partition_budget(cand, capacities_gib, full_attention_interval)
+        except PPLayerPartitionError:
+            continue
+        dev = abs((num_layers - split) / split - vram_ratio)
+        if best is None or dev < best_dev:
+            best, best_dev = cand, dev
+    if best is None:
+        raise PPLayerPartitionError(
+            "PP-PART-006: 无 FA 对齐边界同时满足两卡 VRAM 安全线")
+    return best

@@ -18,6 +18,17 @@
 #     避免 2.5GB 全量反量化。
 #   - 同时保留 float 路径 (load_dequantized) 供 CPU/bf16 合成前向冒烟。
 #
+# Round-4 低温 dequant (修 R3 L3 死因 — prefill dequant f32+int64 临时 ~4.5GB → GPU0 16GB 触顶):
+#   dequant_q6_K / dequant_q8_0 接受 dtype 参数; GEMM 路径 (QuantLinear._weight) 传 x.dtype (bf16),
+#   逐块元素级位提取直接写 bf16 — 不整层 f32 out, 不整层 int64 ql/qh:
+#   ql/qh/sc 是零拷贝 uint8/int8 view 做位提取, q 恰好落 int8 (-32..31),
+#   只在 ≤65536 块的 chunk 内物化 f32 乘积。整层临时仅 bf16 GEMM 权重本身
+#   (FFN 17408×5120×2B ≈ 170MB, 每-GEMM 预算, GEMM 后释放; 每 chunk 片临时 ≤ ~20MB)。
+#   语义与 llama.cpp dequantize_row_q6_K (ggml-quants.c:1939-1968) /
+#   dequantize_row_q8_0 (ggml-quants.c:553-567) / 寄存器级 dequantize_q6_K
+#   (ggml-cuda/dequantize.cuh:246-266, y = d·sc[is]·(q−32)) 位级一致;
+#   torch 引擎不调用 llama.cpp CUDA kernel — 纯 torch 重实现 (sm89 dequant+cuBLAS 路径语义)。
+#
 # Q6_K 布局 (对照 ggml-common.h block_q6_K + ggml-quants.c dequantize_row_q6_K, 210 字节/块):
 #   ql(128,off0) | qh(64,off128) | scales(16,off192) | d(f16,off208)。
 #   每块 2 个 128 组, 组间指针推进 ql+=64, qh+=32, sc+=8。
@@ -39,57 +50,86 @@ Q8_0_BLOCK = 34
 Q6_K_BLOCK = 210
 
 
-def dequant_q8_0(raw: torch.Tensor, n: int) -> torch.Tensor:
-    """Q8_0 raw (uint8, 长度 (n//32)*34) → f32 [n]。对照 ggml-quants.c:553-567。"""
+def dequant_q8_0(raw: torch.Tensor, n: int, dtype=None) -> torch.Tensor:
+    """Q8_0 raw (uint8, 长度 (n//32)*34) → [n]。dtype=None → f32 (float 路径)。
+    y[i*32+j] = qs[j]·d (ggml-quants.c:553-567), 逐块元素级: qs 是零拷贝 int8 view,
+    只在 chunk (≤65536 块) 内物化 f32 乘积再 cast 到 dtype。
+    R4 低温路径: 不再整层 f32 物化 (旧实现 f32 [n] 全驻留, LMHead 5.09GB → 双 cast 到 bf16)。"""
     nb = n // 32
     buf = raw.view(nb, Q8_0_BLOCK)
-    d = buf[:, 0:2].view(torch.float16).float().view(-1)  # [nb]
-    qs = buf[:, 2:34].view(torch.int8).float()           # [nb, 32]
-    return (d.unsqueeze(1) * qs).reshape(-1)[:n]
-
-
-def dequant_q6_K(raw: torch.Tensor, n: int) -> torch.Tensor:
-    """Q6_K raw (uint8, 长度 (n//256)*210) → f32 [n]。
-    逐字对照 ggml-quants.c dequantize_row_q6_K (本 checkout 无 dmin)。"""
-    nb = n // QK_K
-    buf = raw.view(nb, Q6_K_BLOCK)
-    # 块布局 (ggml-common.h block_q6_K): ql[128](0) | qh[64](128) | scales[16](192) | d(f16)(208)
-    d = buf[:, 208:210].view(torch.float16).float().view(-1)  # [nb]
-    ql = buf[:, 0:128].view(torch.uint8).long()               # [nb,128]
-    qh = buf[:, 128:192].view(torch.uint8).long()             # [nb,64]
-    sc = buf[:, 192:208].view(torch.int8).float()             # [nb,16]
-    l = torch.arange(32, device=raw.device)              # [32]
-    is_ = (l // 16).long()                               # 0 或 1
-    out = torch.empty(nb, QK_K, device=raw.device, dtype=torch.float32)
-    for nn in range(2):
-        qo, ho, so = 64 * nn, 32 * nn, 8 * nn            # 组间指针推进
-        q1 = (ql[:, qo:qo + 32] & 0xF) | (((qh[:, ho:ho + 32] >> 0) & 3) << 4) - 32
-        q2 = (ql[:, qo + 32:qo + 64] & 0xF) | (((qh[:, ho:ho + 32] >> 2) & 3) << 4) - 32
-        q3 = (ql[:, qo:qo + 32] >> 4) | (((qh[:, ho:ho + 32] >> 4) & 3) << 4) - 32
-        q4 = (ql[:, qo + 32:qo + 64] >> 4) | (((qh[:, ho:ho + 32] >> 6) & 3) << 4) - 32
-        dd = d.unsqueeze(1)
-        s = sc[:, so:so + 8]
-        out[:, nn * 128 + l + 0] = dd * s[:, is_] * q1
-        out[:, nn * 128 + l + 32] = dd * s[:, is_ + 2] * q2
-        out[:, nn * 128 + l + 64] = dd * s[:, is_ + 4] * q3
-        out[:, nn * 128 + l + 96] = dd * s[:, is_ + 6] * q4
+    out_dtype = torch.float32 if dtype is None else dtype
+    d = buf[:, 0:2].view(torch.float16).float().reshape(-1)  # [nb] f32 (d, f16→f32 无损)
+    qs = buf[:, 2:34].view(torch.int8)            # [nb,32] int8 (零拷贝 view, 无物化)
+    out = torch.empty(nb, 32, device=raw.device, dtype=out_dtype)
+    CH = 65536
+    for c0 in range(0, nb, CH):
+        c1 = min(c0 + CH, nb)
+        out[c0:c1] = (d[c0:c1].unsqueeze(1) * qs[c0:c1].float()).to(out_dtype)
     return out.reshape(-1)[:n]
 
 
-def dequant(raw: torch.Tensor, n: int, ggml_type: int) -> torch.Tensor:
-    """GGUF raw 字节 → f32 [n]。F32/F16/BF16 直接 cast; Q8_0/Q6_K 反量化。"""
+def dequant_q6_K(raw: torch.Tensor, n: int, dtype=None) -> torch.Tensor:
+    """Q6_K raw (uint8, 长度 (n//256)*210) → [n]。dtype=None → f32 (float 路径 / 行 gather)。
+    逐块元素级反量化, 与旧实现和 C 参考位级一致 (y = d·sc[is]·(q−32), q 为 6 位
+    (ql 低 4 位 | qh 2 位<<4)): ggml-quants.c:1939-1968 / ggml-cuda/dequantize.cuh:246-266。
+    R4 低温路径 (修 Round-3 L3 死因): 不整层 f32 out, 不整层 int64 ql/qh —
+      ql/qh/sc 是零拷贝 uint8/int8 view 做位提取, q 恰好落 int8 (-32..31),
+      只在 chunk (≤65536 块) 内物化 f32 乘积, 直接 cast 到 dtype。
+      out 张量本身 (FFN 17408×5120 bf16 ≈ 170MB) 是唯一整层临时 = 每-GEMM 预算,
+      GEMM 后释放; 每 chunk 片临时 ≤ ~20MB。
+      旧实现整层 f32 356MB + int64 ql/qh 890MB + int64 q1..q4 356MB → stage0 ~4.5GB → OOM。
+    语义对照 dequantize.cuh:246-266 (寄存器级, sm89 dequant+cuBLAS 路径等价语义):
+      y[0]=d·sc[is]·((ql&0xF)|((qh>>0)&3)<<4 −32), y[32]=…sc[is+2]·((ql+32&0xF)|((qh>>2)&3)<<4 −32),
+      y[64]=…sc[is+4]·((ql>>4)|((qh>>4)&3)<<4 −32), y[96]=…sc[is+6]·((ql+32>>4)|((qh>>6)&3)<<4 −32)。
+    torch 引擎不调用 llama.cpp CUDA kernel — 纯 torch 重实现其语义。"""
+    nb = n // QK_K
+    buf = raw.view(nb, Q6_K_BLOCK)
+    out_dtype = torch.float32 if dtype is None else dtype
+    d = buf[:, 208:210].view(torch.float16).float().reshape(-1)  # [nb] f32 (d)
+    sc = buf[:, 192:208].view(torch.int8)                  # [nb,16] int8 (零拷贝 view)
+    out = torch.empty(nb, QK_K, device=raw.device, dtype=out_dtype)
+    l = torch.arange(32, device=raw.device)
+    is_ = l // 16                                          # scale 子索引 0/1 (0..15→0, 16..31→1)
+    CH = 65536
+    for c0 in range(0, nb, CH):
+        c1 = min(c0 + CH, nb)
+        dc = d[c0:c1].unsqueeze(1)                         # [c,1] f32
+        for nn in range(2):
+            qo, ho, so = 64 * nn, 32 * nn, 8 * nn          # 组间指针推进
+            lo_a = buf[c0:c1, qo:qo + 32]                  # uint8 view (q1 低 / q3 高 nibble, ql 基址 @0)
+            lo_b = buf[c0:c1, qo + 32:qo + 64]             # uint8 view (q2 / q4, ql 基址 @0)
+            qh = buf[c0:c1, 128 + ho:128 + ho + 32]        # uint8 view (qh 基址 @128, 组偏移 ho=32*nn)
+            s = sc[c0:c1, so:so + 8].float()               # [c,8] f32
+            for k in range(4):
+                src = lo_a if k % 2 == 0 else lo_b
+                qlo = (src & 0xF) if k < 2 else (src >> 4)  # uint8 [c,32]
+                qhi = (qh >> (2 * k)) & 3                   # uint8 [c,32] (qh>>0 / >>2 / >>4 / >>6)
+                q = (qlo | (qhi << 4)).to(torch.int8) - 32  # int8 [c,32], -32..31 (精确)
+                s_exp = s[:, is_ + 2 * k]                   # f32 [c,32] (sc[is], sc[is+2], sc[is+4], sc[is+6])
+                out[c0:c1, nn * 128 + 32 * k: nn * 128 + 32 * (k + 1)] = \
+                    (dc * s_exp * q.float()).to(out_dtype)
+    return out.reshape(-1)[:n]
+
+
+def dequant(raw: torch.Tensor, n: int, ggml_type: int, dtype=None) -> torch.Tensor:
+    """GGUF raw 字节 → [n]。dtype=None → f32 (float 路径, 行为与 R3 一致);
+    dtype=bf16 等 → Q8_0/Q6_K 直接反量化进该 dtype (R4 低温: GEMM 路径传 x.dtype,
+    免 f32→bf16 双物化); F32/F16/BF16 零拷贝 view + 可选 cast。"""
     if ggml_type == GGML_F32:
-        return raw[:n * 4].view(torch.float32)
+        w = raw[:n * 4].view(torch.float32)
+        return w if dtype is None else w.to(dtype)
     if ggml_type == GGML_F16:
-        return raw[:n * 2].view(torch.float16).float()
+        w = raw[:n * 2].view(torch.float16).float()
+        return w if dtype is None else w.to(dtype)
     if ggml_type == GGML_BF16:
         u16 = raw[:n * 2].view(torch.uint16)
         # bf16: 高 16 位即 f32 的高位 → 左移 16 位解释为 f32
-        return (u16.to(torch.int32) << 16).view(torch.float32)
+        w = (u16.to(torch.int32) << 16).view(torch.float32)
+        return w if dtype is None else w.to(dtype)
     if ggml_type == GGML_Q8_0:
-        return dequant_q8_0(raw, n)
+        return dequant_q8_0(raw, n, dtype)
     if ggml_type == GGML_Q6_K:
-        return dequant_q6_K(raw, n)
+        return dequant_q6_K(raw, n, dtype)
     raise ValueError(f"unsupported quant type {ggml_type}")
 
 
@@ -128,7 +168,10 @@ class QuantLinear(nn.Module):
     def _weight(self, dtype):
         if self._raw is not None:
             n = self._shape[0] * self._shape[1]
-            w = dequant(self._raw, n, self._ggml_type).to(dtype)
+            # R4 低温路径: 直接反量化到 GEMM dtype (bf16) — 不整层 f32→bf16 双物化。
+            # dequant 临时 = 这块 bf16 权重本身 (每-GEMM 预算: FFN ≤170MB / LMHead 2.37GiB),
+            # F.linear 后立即释放; 数值与旧实现位级一致。
+            w = dequant(self._raw, n, self._ggml_type, dtype)
             return w.view(self._shape)
         # 无 loader 路径 (k6 合成前向): meta 占位惰性物化到 CPU — torch.empty 不触碰,
         # 无 kaiming/normal_/zeros_/ones_。dtype 沿用模块当前 dtype (k6 .to(bf16) 后为 bf16)。

@@ -18,7 +18,8 @@ import torch
 
 from engine.models import QwenTPConfig, Qwen3ForCausalLMTP
 from engine.pp_layer_partition import (
-    compute_pp_layer_partition, get_stage_layers, assign_mtp_device,
+    compute_pp_layer_partition, compute_pp_layer_partition_budgeted,
+    check_partition_budget, get_stage_layers, assign_mtp_device,
 )
 from engine.pp import init_pp_process_group, get_pp_group
 from engine.framework import Scheduler, ModelRunner, Sequence, SequenceStatus
@@ -45,8 +46,13 @@ class LLMEngine:
         # config + 分区
         self.cfg = QwenTPConfig.from_pretrained(str(self.model_dir))
         num_layers = self.cfg.num_hidden_layers
-        self.partition = compute_pp_layer_partition(num_layers, self.pp_size,
-                                                    vram_ratio=self._vram_ratio())  # list[list[int]]: [[0..27],[28..63]] (28/36 非均分)
+        # R4 fix ②: vram_ratio 切层 + 整 4 维 VRAM 预算校验 (W 权重 + D dequant 临时峰
+        # + A 激活峰 + K KV 配额 + G GDN 状态; 越安全线 → PP-PART-006, pp_size=2 自动重推
+        # FA 对齐边界)。evo-001 的 28/36 满足两卡安全线 (stage0 ~10.01GiB ≤ 15.1 /
+        # stage1 ~14.99GiB ≤ 21.1) → 原样保留。
+        self.partition = compute_pp_layer_partition_budgeted(
+            num_layers, self.pp_size, vram_ratio=self._vram_ratio())
+        self.stage_vram = check_partition_budget(self.partition)  # 预算明细 (内省 / 日志)
         self.stage_layers = get_stage_layers(num_layers, self.pp_rank, self.pp_size,
                                              partition_list=self.partition)
         self._mtp_device = assign_mtp_device(self.partition, self.cfg.mtp_layers[0],
