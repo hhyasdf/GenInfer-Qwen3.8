@@ -7,14 +7,36 @@
 #   - FA 层: per-stage KV (按层切, 不按 head 切)。
 #   - GDN 层: per-layer recurrent state [n_v, Dk, Dv] fp32, 归本 stage。
 # 首 stage 持 token_embd, 末 stage 持 LMHead; 中间 stage 传 IntermediateTensors。
+# R5 (Issue 8): 模型有 MTP 块时, 边界增传 token_embd 键 (首 rank 输入 token 的
+# embedding, llama.cpp graph_mtp 双图输入 inp->embd 语义), 末 rank MTP 块从边界读。
 import math
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..kernels import RMSNorm
-from ..pp import get_pp_group, IntermediateTensors, make_empty_intermediate_tensors
+from ..pp import get_pp_group, IntermediateTensors, make_empty_intermediate_tensors, PPError
 from ..weights.quant_linear import QuantLinear, QuantEmbedding
+
+
+def _logits_finiteness_diag(logits):
+    """② logits 有限性诊断 (引擎侧, 供 Verification L3 采集)。
+    只读: torch.isfinite 全量扫描 + 首个非有限 logit 的位置/数值/占比。
+    不改任何数值路径, 不影响 greedy 采样 (下游 argmax 消费的是原 logits)。
+    单行 [LOGITS-DIAG] 输出, 可 grep。"""
+    fin = torch.isfinite(logits)
+    total = int(fin.numel())
+    n_fin = int(fin.sum().item())
+    if n_fin == total:
+        print(f"[LOGITS-DIAG] shape={tuple(logits.shape)} dtype={logits.dtype} "
+              f"finite={total}/{total} (all finite)", flush=True)
+        return
+    first = (~fin).nonzero()[0].tolist()
+    val = float(logits[tuple(first)])
+    print(f"[LOGITS-DIAG] shape={tuple(logits.shape)} dtype={logits.dtype} "
+          f"finite={n_fin}/{total} non_finite_ratio={(total - n_fin) / total:.6f} "
+          f"first_nonfinite pos={first} value={val}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -370,14 +392,16 @@ class Qwen3ForCausalLMTP(nn.Module):
             B, T = input_ids.shape[0], input_ids.shape[1]
         else:
             B, T = hidden_states.shape[0], hidden_states.shape[1]
+        token_emb_local = None  # 首 rank 输入 token 的 embedding (graph_mtp inp->embd)
         # 非首 stage: forward 前 recv 边界激活
         if not g.is_first_rank:
             it = g.recv_tensor_dict()
             hidden_states = it.tensors["hidden_states"]
             residual = it.tensors["residual"]
-        # 首 stage: embedding
+        # 首 stage: embedding (输出即输入 token 的 embedding, 层消费前捕获)
         if g.is_first_rank:
             hidden_states = self.token_embd(input_ids).to(torch.bfloat16)
+            token_emb_local = hidden_states
             residual = None
         if position_ids is None:
             position_ids = torch.arange(T, device=hidden_states.device)
@@ -388,23 +412,47 @@ class Qwen3ForCausalLMTP(nn.Module):
             hidden_states, residual, kv_cache, gdn_states = self.layers[i](
                 hidden_states, residual, kv_cache, gdn_states, position_ids)
         if self.mtp is not None:
-            token_emb = self.token_embd(input_ids).to(torch.bfloat16) if input_ids is not None else hidden_states
+            # R5 (Issue 8): MTP 的 enorm 输入是**输入 token 的 embedding**, 不是 target 输出
+            # hidden state — llama.cpp graph_mtp 双图输入 (qwen35.cpp:512 inp->embd /
+            # :527 inp->h), token_emb 由 ggml_get_rows 从共享 embedding 权重行 gather
+            # (:519-521)。PP 切层下 embedding 权重在首 rank、MTP 块在末 rank → token_emb
+            # 必须跨 PP 边界:
+            #   首 rank = 本地 embedding 输出 (token_emb_local, 层消费前的 alias; RMSNorm
+            #   只分配新张量不原地改输入, alias 稳定 — rms_norm.py:53-72);
+            #   其他 rank = 边界 token_embd 键 (pp.py IntermediateTensors 声明的缝)。
+            # ⛔ 禁 self.token_embd(input_ids) (末 rank 为 None → R4 死点 TypeError) 与
+            # else-hidden_states 兜底 (eh_proj 两路同为同一向量 → draft 数值必错)。
+            token_emb = token_emb_local if g.is_first_rank else it.tensors.get("token_embd")
+            if token_emb is None:
+                raise PPError("PP-COMM-007: MTP 块需要输入 token embedding — 边界缺 "
+                              "token_embd 键 (cfg.mtp_layers 非空时首 rank 必须打包)")
             _, kv_cache = self.mtp(hidden_states, token_emb, kv_cache, position_ids)
         if self.is_last_rank:
             normalized, _ = self.output_norm(hidden_states, residual)
             logits = self.lm_head(normalized)
+            _logits_finiteness_diag(logits)  # ② 只读诊断, 不改数值路径
             return logits, kv_cache, gdn_states
         # 非末 stage: 打包边界激活并 send
-        it = IntermediateTensors({
+        t = {
             "hidden_states": hidden_states.contiguous(),
             "residual": (residual if residual is not None else torch.zeros_like(hidden_states)).contiguous(),
-        })
-        g.send_tensor_dict(it)
+        }
+        # R5: 模型有 MTP 块 → 末 rank MTP 需要输入 token embedding, 首 rank 把自身 embedding
+        # 输出打包为第 3 键 token_embd (shape (B,T,hidden) bf16); 无 MTP 则不发 (省边界流量)。
+        if self.token_embd is not None and self.cfg.mtp_layers:
+            t["token_embd"] = token_emb_local.contiguous()
+        g.send_tensor_dict(IntermediateTensors(t))
         return None, kv_cache, gdn_states
 
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens, temperature=0.0):
+        """贪婪生成。PP 多 rank: 各 rank 锁步跑同环; 末 rank 采样出的 token 经 P2P
+        传回首 rank (dst=(rank+1)%pp_size, rank1 回绕到 0), 首 rank 接收
+        (src=(rank-1)%pp_size 回绕到末 rank) 后推进下一步输入 — 否则首 rank 会
+        永远拿原 prompt 重复 prefill (R4 潜伏点: 本地 generated 在首 rank 恒空)。
+        单 rank (pp_size==1 / dist 未初始化) 直通, 无 P2P。"""
         g = get_pp_group()
+        multi = dist.is_initialized() and g.pp_size > 1
         generated = []
         cur = input_ids
         past_len = input_ids.shape[1]
@@ -416,7 +464,7 @@ class Qwen3ForCausalLMTP(nn.Module):
             else:
                 # decode: 单 token, 位置 = past_len + (step-1)
                 pos = past_len + step - 1
-                position_ids = torch.stack([torch.tensor([pos])] * 3)
+                position_ids = torch.stack([torch.tensor([pos], device=cur.device)] * 3)
             out = self.forward(input_ids=cur, kv_cache=kv_cache,
                                gdn_states=gdn_states, position_ids=position_ids)
             if g.is_last_rank:
@@ -424,13 +472,19 @@ class Qwen3ForCausalLMTP(nn.Module):
                 nxt = torch.argmax(logits[0, -1]).item() if temperature == 0.0 else _sample(logits, temperature)
                 generated.append(nxt)
                 cur = torch.tensor([[nxt]], device=cur.device, dtype=cur.dtype)
-                # PP 多 rank: 末 rank 需把采样 token 传回首 rank (P2P, dst=0)
-                # 单 rank (pp_size=1) 无此步。多 rank 协调为 E2E/Verification 职责。
+                if multi:
+                    # R5: 采样 token → 首 rank (P2P, 回绕 dst=0)
+                    tok = torch.tensor([nxt], device=cur.device, dtype=cur.dtype)
+                    dist.send(tok, dst=g._norm_dst(None), group=g.device_group)
             else:
                 _, kv_cache, gdn_states = out
-                # 非末 stage: 跟随已生成 token (多 rank 需从末 rank recv)
-                if generated:
-                    cur = torch.tensor([[generated[-1]]], device=cur.device, dtype=cur.dtype)
+                if multi and g.is_first_rank:
+                    # R5: 首 rank ← 采样 token (P2P, 回绕 src=末 rank)
+                    tok = torch.empty(1, device=cur.device, dtype=cur.dtype)
+                    dist.recv(tok, src=g._norm_src(None), group=g.device_group)
+                    nxt = int(tok.item())
+                    generated.append(nxt)
+                    cur = torch.tensor([[nxt]], device=cur.device, dtype=cur.dtype)
         return generated
 
 

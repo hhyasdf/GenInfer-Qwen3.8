@@ -3,7 +3,9 @@
 # 核心语义 (唯一契约来源):
 #   - PP 边界 = 相邻 rank 的单向 P2P send/recv 激活流, **不是集合通信**。
 #   - stage0 持 token_embd, 末 stage 持 output(LMHead); 中间 stage 只传
-#     IntermediateTensors({"hidden_states","residual"})。
+#     IntermediateTensors({"hidden_states","residual"})。模型有 MTP 块时边界增传
+#     token_embd 键 (输入 token embedding, 首 rank 打包 / 末 rank MTP 块读取 —
+#     llama.cpp graph_mtp 双图输入 inp->embd 语义, evo-001 R5 接线)。
 #   - 边界禁 all_reduce / all_gather / broadcast (那是 TP 语义)。
 #   - dst=(rank+1)%pp_size, src=(rank-1)%pp_size。
 #   - world_size==1 (dist 未初始化) → send 直通返回 dict, recv 返回 None。
@@ -50,10 +52,13 @@ class IntermediateTensors:
 
 def make_empty_intermediate_tensors(hidden_size: int, device, dtype) -> IntermediateTensors:
     """(hidden_size:int, device, dtype) -> IntermediateTensors。
-    hidden_states/residual 各 shape (1, hidden_size)。"""
+    hidden_states/residual/token_embd 各 shape (1, hidden_size)。
+    R5 (Issue 8): 同步建 token_embd 占位 — 末 rank MTP 块跨边界读取的输入 token
+    embedding (llama.cpp graph_mtp inp->embd); 模型无 MTP 块的调用方不发送此键。"""
     return IntermediateTensors({
         "hidden_states": torch.zeros(1, hidden_size, device=device, dtype=dtype),
         "residual": torch.zeros(1, hidden_size, device=device, dtype=dtype),
+        "token_embd": torch.zeros(1, hidden_size, device=device, dtype=dtype),
     })
 
 
@@ -115,7 +120,12 @@ class PPGroup:
         # 元数据 (key, shape, dtype, device, is_tensor) 走 CPU gloo pickle 协议。
         # device 只抓 type (如 "cuda"/"cpu"), 不抓 index — 接收侧按本 rank 当前设备
         # 分配缓冲区 (vllm "receiving side will set the device index", :77-86 注释)。
-        meta = [(k, tuple(v.shape), v.dtype,
+        # R5: shape/dtype 提取与 device 一样按 is_tensor 防护 (R4 潜伏缺陷: 非 tensor
+        # 值会先在 tuple(v.shape) 上 AttributeError, 防护只在 device 一行)。接收侧
+        # 对 is_tensor=False 条目 continue, 与本防护对称。
+        meta = [(k,
+                 tuple(v.shape) if isinstance(v, torch.Tensor) else None,
+                 v.dtype if isinstance(v, torch.Tensor) else None,
                  v.device.type if isinstance(v, torch.Tensor) else None,
                  isinstance(v, torch.Tensor))
                 for k, v in tensor_dict.items()]
