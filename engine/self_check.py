@@ -137,7 +137,18 @@ def main():
         from engine.pp import init_pp_process_group
         init_pp_process_group()
         m = Qwen3ForCausalLMTP(cfg, pp_rank=0, pp_size=1, stage_layers=[0, 1, 2, 3])
-        m = m.to(torch.bfloat16).eval()  # 生产流: 权重 bf16
+        # Issue 9 (R5 漏检根因): 旧版 `m.to(torch.bfloat16)` 整模型 cast 把 f32 norm
+        # 权重一并转 bf16 → 无 dtype 失配 → fused 内核 weight-dtype 守卫从未被验证
+        # (合成自检弱于且分叉于生产 dtype 流)。改为模仿生产绑定路径 (weight_loader 逐
+        # 张量, 无模型级 cast): 线性权重/激活流 bf16, F32 norm 权重保持 f32 (GGUF F32
+        # norm 绑为 f32 Parameter)。修复后 k6 复现 fused 路径 dtype 守卫 — f32 weight
+        # + bf16 input → _can_fused 守卫失配 → fallback f32 累加参考路径, 不崩。
+        m = m.to(torch.bfloat16)
+        from engine.kernels import RMSNorm
+        for module in m.modules():
+            if isinstance(module, RMSNorm):
+                module.weight.data = module.weight.data.to(torch.float32)
+        m.eval()
         ids = torch.tensor([[1, 2, 3]])
         out = m(input_ids=ids)
         assert out[0] is not None and out[0].shape[-1] == 256

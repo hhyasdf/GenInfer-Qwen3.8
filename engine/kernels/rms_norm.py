@@ -44,11 +44,23 @@ class RMSNorm(nn.Module):
     def _scale(self, w: torch.Tensor) -> torch.Tensor:
         return 1.0 + w if self.ones_plus else w
 
-    @staticmethod
-    def _can_fused(x: torch.Tensor) -> bool:
-        # vllm rms_norm 仅 CUDA 后端; bf16 + contiguous + cuda + 非 ones_plus
+    def _can_fused(self, x: torch.Tensor) -> bool:
+        # vllm rms_norm 仅 CUDA 后端; bf16 + contiguous + cuda + 非 ones_plus。
+        # Issue 9 (R5 死点): weight dtype 必须 == 输入 dtype。GGUF 的 F32 norm 权重被
+        # weight_loader._bind 绑为 f32 Parameter (weight_loader.py:230 的
+        # obj.copy_(w.to(obj.dtype)) 对 F32 是 no-op — obj.dtype 本就是 f32), 而生产流
+        # 是 bf16 (qwen.py:403 token_embd 输出显式 cast bf16)。vllm fused 内核按**输入**
+        # 类型派发并读 weight.data_ptr<scalar_t>() (layernorm_kernels.cu:211/:222, fused
+        # 变体 :243 显式 TORCH_CHECK weight.scalar_type()==input.scalar_type()) → f32
+        # weight + bf16 input = "expected scalar type BFloat16 but found Float" 硬崩。
+        # 失配时 fallback 到下方 dtype 无关的 torch 参考路径 (f32 累加 — 与 llama.cpp
+        # 原生 F32 RMSNorm 语义一致: ggml-cpu/ops.cpp:3989-4004 switch 只处理 F32 其余
+        # ABORT, fused MUL 读 float* weight; ggml-cuda/norm.cu:478-500 断言 F32)。
+        # 对照 vllm 不变量 (layernorm.py:104-116 weight 按模型 dtype 创建 → weight.dtype
+        # == 激活 dtype 结构性保证), 本引擎量化驻留路径无模型级 cast, 故由内核门禁守卫。
         return (_HAS_VLLM_OPS and x.dtype == torch.bfloat16
-                and x.is_contiguous() and x.device.type == "cuda")
+                and x.is_contiguous() and x.device.type == "cuda"
+                and self.weight.dtype == x.dtype)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
         # 首层: residual=None → 仅归一化, 返回 (normalized, x.clone())
