@@ -129,9 +129,11 @@ def _read_value(f, vt: int):
     raise ValueError(f"unsupported GGUF value type {vt}")
 
 
-def read_gguf(path) -> tuple[dict, dict]:
-    """读 GGUF 头 → (metadata, {tensor_name: (shape, ggml_type, data_offset)})。
-    shape 是 GGUF 序 (innermost, ..., outermost), 调用方自行反转为 torch 序。"""
+def read_gguf(path) -> tuple[dict, dict, int]:
+    """读 GGUF 头 → (metadata, {tensor_name: (shape, ggml_type, stored_offset)}, data_offset)。
+    shape 是 GGUF 序 (innermost, ..., outermost), 调用方自行反转为 torch 序。
+    stored_offset 是**数据区相对**偏移 (GGUF v3): 绝对文件位置 = data_offset + stored_offset。
+    data_offset = header 按 32 对齐末尾 = 数据区起始文件位置 (本模型 = 10,995,040)。"""
     with open(path, 'rb') as f:
         magic = f.read(4)
         assert magic == b'GGUF', f"not a GGUF file: {path}"
@@ -151,7 +153,10 @@ def read_gguf(path) -> tuple[dict, dict]:
             t = struct.unpack('<I', f.read(4))[0]
             offset = struct.unpack('<Q', f.read(8))[0]
             tensor_info[name] = (tuple(dims), t, offset)
-    return metadata, tensor_info
+        header_end = f.tell()
+    # 数据区起点 = header (magic+version+n_tensors+n_kv+全部 KV+全部 tensor definitions) 按 32 对齐末尾
+    data_offset = (header_end + 31) // 32 * 32
+    return metadata, tensor_info, data_offset
 
 
 def tensor_nbytes(shape: tuple, t: int) -> int:
@@ -173,14 +178,14 @@ def load_gguf_raw(path, names: list[str] | None = None,
     """读 GGUF → {name: {raw: torch.uint8, shape: torch序, ggml_type: int}}。
     量化字节原样驻留 (不上卡前不反量化) — D-6a 量化驻留路径。
     names=None 则全读。"""
-    metadata, tensor_info = read_gguf(path)
+    metadata, tensor_info, data_offset = read_gguf(path)
     out: dict[str, dict] = {}
     with open(path, 'rb') as f:
         for name, (shape, t, offset) in tensor_info.items():
             if names is not None and name not in names:
                 continue
             nbytes = tensor_nbytes(shape, t)
-            f.seek(offset)
+            f.seek(data_offset + offset)  # stored_offset 是数据区相对, 基址 = data_offset
             raw = f.read(nbytes)
             arr = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
             out[name] = {"raw": arr, "shape": tuple(reversed(shape)), "ggml_type": t}
@@ -190,7 +195,7 @@ def load_gguf_raw(path, names: list[str] | None = None,
 def load_gguf_tensors(path, names: list[str] | None = None) -> dict:
     """反量化 GGUF tensors → {name: torch f32 tensor} (torch 序 shape)。
     用于 CPU/bf16 合成前向冒烟与小 tensor 预反量化 (非主权重路径)。"""
-    metadata, tensor_info = read_gguf(path)
+    metadata, tensor_info, data_offset = read_gguf(path)
     out = {}
     with open(path, 'rb') as f:
         for name, (shape, t, offset) in tensor_info.items():
@@ -198,7 +203,7 @@ def load_gguf_tensors(path, names: list[str] | None = None) -> dict:
                 continue
             n = int(np.prod(shape)) if shape else 1
             nbytes = tensor_nbytes(shape, t)
-            f.seek(offset)
+            f.seek(data_offset + offset)  # stored_offset 是数据区相对, 基址 = data_offset
             raw = f.read(nbytes)
             arr = _dequant(raw, n, t)
             torch_shape = list(reversed(shape))
@@ -209,7 +214,7 @@ def load_gguf_tensors(path, names: list[str] | None = None) -> dict:
 
 def read_chat_template(path) -> str:
     """从 GGUF metadata 读 chat_template (tokenizer.ggml.* 内嵌)。"""
-    metadata, _ = read_gguf(path)
+    metadata, _, _ = read_gguf(path)
     return metadata.get('tokenizer.chat_template', '')
 
 
@@ -217,7 +222,7 @@ def read_tokenizer_meta(path) -> dict:
     """从 GGUF metadata 抽 tokenizer.ggml.* → dict。供 D-6b 真实 BPE 用。
     返回 keys: tokens(list[str]), merges(list[list[str]]), pre(str), bos_token_id,
     eos_token_id, model(str), byte_encode(bool), special_tokens(dict)。"""
-    metadata, _ = read_gguf(path)
+    metadata, _, _ = read_gguf(path)
     def g(key, default=None):
         return metadata.get(key, default)
     return {

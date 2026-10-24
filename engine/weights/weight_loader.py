@@ -225,6 +225,8 @@ class PPWeightLoader:
             return 1
         if isinstance(obj, nn.Parameter):
             n = int(torch.tensor(info["shape"]).prod())
+            # ⚠️ R12 防误改: info["shape"] = GGUF dims 反序 (torch 序)。文件字节 ne[0] 最内层
+            # row-major, view(反序) == view(GGUF序).T 真转置 (与 QuantLinear._weight 同理)。
             w = dequant(info["raw"], n, info["ggml_type"]).view(info["shape"])
             with torch.no_grad():
                 obj.copy_(w.to(obj.dtype))
