@@ -213,16 +213,18 @@ class FullAttention(nn.Module):
 
     def _apply_mrope(self, x, position_ids):
         """x:[B,T,n,d]。position_ids:[3,T] (t,h,w)。只对前 rope_dim 维旋转 (partial rotary)。
-        Risk 1: section 和=32=rope_dim/2 (32 个旋转对, 每对 2 维); 第 32+ 对用轴 0。"""
+        R16 FIX: NeOX 配对 (j, j+half) — 对齐 Qwen3 rotate_half / llama.cpp ggml_rope。
+        (原 adjacent 配对 (2p,2p+1) 是 r13 CPU 参考共享的 bug; R12 对齐 1e-7 为循环论证。)
+        x1/x2 先切片再算, 不写回 x_rot → 无 in-place 视图污染。"""
         rope_dim = self.rope_dim
-        d = x.shape[-1]
         x_rot, x_pass = x[..., :rope_dim], x[..., rope_dim:]
         n_pairs = rope_dim // 2
+        half = n_pairs
         sec = self.mrope_section
         axis = [0 if p < sec[0] else (1 if p < sec[0] + sec[1] else 2) for p in range(n_pairs)]
         axis = torch.tensor(axis, device=x.device)
-        x1 = x_rot[..., 0::2]
-        x2 = x_rot[..., 1::2]
+        x1 = x_rot[..., :half]                # 前半 channels 0..half-1
+        x2 = x_rot[..., half:2 * half]        # 后半 channels half..2*half-1
         inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, rope_dim, 2, device=x.device).float() / rope_dim))
         # 每旋转对 p 选轴 axis[p]; pos[p, t] = position_ids[axis[p], t] → [n_pairs, T]
         T = x.shape[1]
@@ -231,8 +233,8 @@ class FullAttention(nn.Module):
         cos = freqs.cos().t().view(1, T, 1, n_pairs)         # [1, T, 1, n_pairs]
         sin = freqs.sin().t().view(1, T, 1, n_pairs)
         out = torch.empty_like(x_rot)
-        out[..., 0::2] = x1 * cos - x2 * sin
-        out[..., 1::2] = x2 * cos + x1 * sin
+        out[..., :half] = x1 * cos - x2 * sin
+        out[..., half:2 * half] = x2 * cos + x1 * sin
         return torch.cat([out, x_pass], dim=-1)
 
     def _norm_head(self, x, norm):
@@ -242,12 +244,21 @@ class FullAttention(nn.Module):
     def forward(self, x, kv_cache, position_ids):
         """x:[B,T,hidden] (已归一化)。返回 (attn_out [B,T,hidden], kv_cache)。"""
         B, T, _ = x.shape
-        qg = self.wq(x)
-        q, gate = qg[..., :self.qg_dim], qg[..., self.qg_dim:2 * self.qg_dim]
+        qg = self.wq(x)   # [B,T, 2*qg_dim] 联合 QG 投影 (q+gate 交织)
+        # R17 FIX (per-head interleaved q/gate 布局): 对齐 llama.cpp qwen35.cpp:275-292
+        #   ggml_view_3d(Qcur_full, n_embd_head, n_head, n_tokens,
+        #       el*2*n_embd_head, el*2*n_embd_head*n_head, {offset 0 | el*n_embd_head})
+        #   → head h 的 q = 通道 [2*head_dim*h, 2*head_dim*h + head_dim),
+        #     head h 的 gate = 通道 [2*head_dim*h + head_dim, 2*head_dim*h + 2*head_dim)。
+        # 与 oracle fa_layer (diag_r16/r16_oracle_gpu.py:164-166) Qfull.reshape(N_HEAD, HEAD_DIM*2, T)
+        # 同布局 (H4 已证复现 llama.cpp 参考 token 流)。原 block-split ("前 qg_dim 行全 q +
+        #  后 qg_dim 行全 gate") 把 head h 的 q/gate 绑定到错误权重行 → 输出方向级错误,
+        # 在 normalized 逐位匹配前提下 il3 attn_out relmax 7.69-10.6 (R16 报告 H8 根因域)。
+        qg_v = qg.view(B, T, self.n_heads, 2, self.head_dim)
+        q = qg_v[:, :, :, 0, :]       # [B,T,n_heads,head_dim] head h 的 q = 通道 [512h, 512h+256)
+        gate = qg_v[:, :, :, 1, :]    # [B,T,n_heads,head_dim] head h 的 gate = 通道 [512h+256, 512h+512)
         k = self.wk(x)
         v = self.wv(x)
-        q = q.view(B, T, self.n_heads, self.head_dim)
-        gate = gate.view(B, T, self.n_heads, self.head_dim)
         k = k.view(B, T, self.n_kv, self.head_dim)
         v = v.view(B, T, self.n_kv, self.head_dim)
         q = self._norm_head(q, self.attn_q_norm)
